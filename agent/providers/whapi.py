@@ -42,7 +42,9 @@ class ProveedorWhapi(ProveedorWhatsApp):
         url = self.url_presencia.format(chat_id=telefono)
         async with httpx.AsyncClient() as client:
             try:
-                await client.put(url, json={"presence": "composing"}, headers=headers)
+                r = await client.put(url, json={"type": "composing"}, headers=headers)
+                if r.status_code not in (200, 201):
+                    logger.info(f"indicar_escribiendo: {r.status_code} — {r.text}")
             except Exception as e:
                 logger.info(f"indicar_escribiendo falló (no crítico): {e}")
 
