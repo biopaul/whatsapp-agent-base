@@ -1,0 +1,20 @@
+# config/business.yaml — Datos del negocio
+# Completar con la información del cliente antes del deploy
+
+negocio:
+  nombre: "[NOMBRE DEL NEGOCIO]"
+  descripcion: "[DESCRIPCIÓN DETALLADA — qué ofrece, a quién, cómo]"
+  horario: "[HORARIO DE ATENCIÓN]"
+  sitio_web: "[URL DEL SITIO WEB]"
+
+agente:
+  nombre: "[NOMBRE DEL AGENTE]"
+  tono: "[TONO — ej: cercano y profesional, formal, amigable]"
+  casos_de_uso:
+    - "[CASO DE USO 1]"
+    - "[CASO DE USO 2]"
+
+metadata:
+  creado: "[FECHA]"
+  version: "1.0"
+  proveedor_whatsapp: "[whapi | meta | twilio]"
