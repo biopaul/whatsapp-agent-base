@@ -16,7 +16,7 @@ class ProveedorWhapi(ProveedorWhatsApp):
     def __init__(self):
         self.token = os.getenv("WHAPI_TOKEN")
         self.url_envio = "https://gate.whapi.cloud/messages/text"
-        self.url_presencia = "https://gate.whapi.cloud/chats/{chat_id}/presence"
+        self.url_presencia = "https://gate.whapi.cloud/presences/{chat_id}"
 
     async def parsear_webhook(self, request: Request) -> list[MensajeEntrante]:
         """Parsea el payload de Whapi.cloud."""
@@ -42,7 +42,7 @@ class ProveedorWhapi(ProveedorWhatsApp):
         url = self.url_presencia.format(chat_id=telefono)
         async with httpx.AsyncClient() as client:
             try:
-                await client.post(url, json={"presence": "composing"}, headers=headers)
+                await client.put(url, json={"presence": "composing"}, headers=headers)
             except Exception as e:
                 logger.debug(f"indicar_escribiendo falló (no crítico): {e}")
 
