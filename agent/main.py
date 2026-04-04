@@ -7,6 +7,7 @@ Funciona con cualquier proveedor (Whapi, Meta, Twilio) gracias a la capa de prov
 """
 
 import os
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
@@ -119,8 +120,13 @@ async def webhook_handler(request: Request):
 
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
-            await proveedor.enviar_mensaje(msg.telefono, respuesta)
 
+            # Mostrar "está escribiendo..." y simular tiempo de escritura
+            await proveedor.indicar_escribiendo(msg.telefono)
+            delay = min(len(respuesta) * 0.025, 5.0)  # ~25ms por caracter, máx 5s
+            await asyncio.sleep(delay)
+
+            await proveedor.enviar_mensaje(msg.telefono, respuesta)
             logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
 
         return {"status": "ok"}

@@ -16,6 +16,7 @@ class ProveedorWhapi(ProveedorWhatsApp):
     def __init__(self):
         self.token = os.getenv("WHAPI_TOKEN")
         self.url_envio = "https://gate.whapi.cloud/messages/text"
+        self.url_presencia = "https://gate.whapi.cloud/chats/{chat_id}/presence"
 
     async def parsear_webhook(self, request: Request) -> list[MensajeEntrante]:
         """Parsea el payload de Whapi.cloud."""
@@ -29,6 +30,21 @@ class ProveedorWhapi(ProveedorWhatsApp):
                 es_propio=msg.get("from_me", False),
             ))
         return mensajes
+
+    async def indicar_escribiendo(self, telefono: str) -> None:
+        """Muestra el indicador '...' en WhatsApp mientras el agente procesa."""
+        if not self.token:
+            return
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+        url = self.url_presencia.format(chat_id=telefono)
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(url, json={"presence": "composing"}, headers=headers)
+            except Exception as e:
+                logger.debug(f"indicar_escribiendo falló (no crítico): {e}")
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
         """Envía mensaje via Whapi.cloud."""
