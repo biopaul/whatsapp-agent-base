@@ -75,6 +75,12 @@ async def health_check():
     return {"status": "ok", "service": "whatsapp-agent"}
 
 
+@app.post("/webhook/statuses")
+async def webhook_statuses(request: Request):
+    """Recibe eventos de estado de Whapi (ticks, receipts). Se ignoran por ahora."""
+    return {"status": "ok"}
+
+
 @app.get("/webhook")
 async def webhook_verificacion(request: Request):
     """Verificación GET del webhook (requerido por Meta Cloud API)."""

@@ -44,7 +44,7 @@ class ProveedorWhapi(ProveedorWhatsApp):
             try:
                 await client.put(url, json={"presence": "composing"}, headers=headers)
             except Exception as e:
-                logger.debug(f"indicar_escribiendo falló (no crítico): {e}")
+                logger.info(f"indicar_escribiendo falló (no crítico): {e}")
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
         """Envía mensaje via Whapi.cloud."""
