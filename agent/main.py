@@ -27,18 +27,28 @@ logger = logging.getLogger("agentkit")
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
 
-# Frase que el agente usa al responder temas off-topic
-_FRASE_OFFTOPIC = "no estoy autorizada a responderlo"
+def _silencios_consecutivos(historial: list[dict]) -> int:
+    """Cuenta cuántos mensajes consecutivos del asistente son SILENCIO al final del historial."""
+    count = 0
+    for msg in reversed(historial):
+        if msg["role"] == "assistant":
+            if msg["content"].strip() == "SILENCIO":
+                count += 1
+            else:
+                break
+    return count
 
 
-def _usuario_insistente(historial: list[dict]) -> bool:
+def _debe_prebloquear(historial: list[dict]) -> bool:
     """
-    Retorna True si el agente ya dio el aviso off-topic 2+ veces
-    en los últimos 10 mensajes. En ese caso no se llama a Claude.
+    Pre-bloquea sin llamar a Claude si hay silencios consecutivos recientes,
+    pero cada 3 silencios deja pasar un mensaje para que Claude evalúe
+    si el cliente retomó con una consulta legítima.
     """
-    ultimos = [m for m in historial[-10:] if m["role"] == "assistant"]
-    avisos = sum(1 for m in ultimos if _FRASE_OFFTOPIC in m["content"].lower())
-    return avisos >= 2
+    n = _silencios_consecutivos(historial)
+    if n == 0:
+        return False
+    return n % 3 != 0
 
 
 @asynccontextmanager
@@ -91,15 +101,19 @@ async def webhook_handler(request: Request):
 
             historial = await obtener_historial(msg.telefono)
 
-            # Si el usuario insiste con temas off-topic, no gastar créditos
-            if _usuario_insistente(historial):
-                logger.info(f"Usuario {msg.telefono} ignorado — insistencia off-topic")
+            # Pre-bloquear si hay silencios consecutivos recientes (sin llamar a Claude)
+            if _debe_prebloquear(historial):
+                await guardar_mensaje(msg.telefono, "user", msg.texto)
+                await guardar_mensaje(msg.telefono, "assistant", "SILENCIO")
+                logger.info(f"Pre-bloqueado {msg.telefono} ({_silencios_consecutivos(historial)} silencios consecutivos)")
                 continue
 
             respuesta = await generar_respuesta(msg.texto, historial)
 
-            # Si el modelo indica silencio explícito, no responder
+            # Si Claude indica silencio, guardar en DB y no enviar
             if respuesta.strip() == "SILENCIO":
+                await guardar_mensaje(msg.telefono, "user", msg.texto)
+                await guardar_mensaje(msg.telefono, "assistant", "SILENCIO")
                 logger.info(f"Silencio activado para {msg.telefono}")
                 continue
 
