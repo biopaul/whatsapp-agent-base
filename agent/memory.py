@@ -90,6 +90,20 @@ async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
         ]
 
 
+async def obtener_ultimo_timestamp(telefono: str) -> datetime | None:
+    """Retorna el timestamp del último mensaje de una conversación, o None si no hay."""
+    async with async_session() as session:
+        query = (
+            select(Mensaje.timestamp)
+            .where(Mensaje.telefono == telefono)
+            .order_by(Mensaje.timestamp.desc())
+            .limit(1)
+        )
+        result = await session.execute(query)
+        row = result.scalar_one_or_none()
+        return row
+
+
 async def limpiar_historial(telefono: str):
     """Borra todo el historial de una conversación."""
     async with async_session() as session:

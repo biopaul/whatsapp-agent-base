@@ -9,14 +9,19 @@ Funciona con cualquier proveedor (Whapi, Meta, Twilio) gracias a la capa de prov
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 
 from agent.brain import generar_respuesta
-from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
+from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp
 from agent.providers import obtener_proveedor
+
+# Zona horaria configurable — default: Argentina (GMT-3)
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "-3"))
+TZ_LOCAL = timezone(timedelta(hours=TZ_OFFSET))
 
 load_dotenv()
 
@@ -50,6 +55,30 @@ def _debe_prebloquear(historial: list[dict]) -> bool:
     if n == 0:
         return False
     return n % 3 != 0
+
+
+def _saludo_por_hora() -> str:
+    """Retorna el saludo apropiado según la hora local configurada."""
+    hora = datetime.now(TZ_LOCAL).hour
+    if 6 <= hora < 12:
+        return "Buen día"
+    elif 12 <= hora < 20:
+        return "Buenas tardes"
+    else:
+        return "Buenas noches"
+
+
+async def _es_nueva_sesion(telefono: str) -> bool:
+    """
+    Retorna True si el último mensaje fue de un día diferente (en hora local)
+    o si no hay historial previo.
+    """
+    ultimo = await obtener_ultimo_timestamp(telefono)
+    if ultimo is None:
+        return True
+    ahora = datetime.now(TZ_LOCAL)
+    ultimo_local = ultimo.replace(tzinfo=timezone.utc).astimezone(TZ_LOCAL)
+    return ahora.date() != ultimo_local.date()
 
 
 @asynccontextmanager
@@ -115,7 +144,13 @@ async def webhook_handler(request: Request):
                 logger.info(f"Pre-bloqueado {msg.telefono} ({_silencios_consecutivos(historial)} silencios consecutivos)")
                 continue
 
-            respuesta = await generar_respuesta(msg.texto, historial)
+            # Detectar si es nueva sesión (nuevo día) y armar saludo
+            contexto = ""
+            if await _es_nueva_sesion(msg.telefono):
+                saludo = _saludo_por_hora()
+                contexto = f"Es el primer mensaje del día de este cliente. Comenzá tu respuesta con '{saludo}' de forma natural, integrado en tu mensaje (no como fórmula aislada)."
+
+            respuesta = await generar_respuesta(msg.texto, historial, contexto)
 
             # Si Claude indica silencio, guardar en DB y no enviar
             if respuesta.strip() == "SILENCIO":

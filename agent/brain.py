@@ -106,13 +106,14 @@ async def _responder_gemini(system_prompt: str, mensajes: list[dict]) -> str:
     return response.text
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
+async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra: str = "") -> str:
     """
     Genera una respuesta usando el proveedor de IA configurado en AI_PROVIDER.
 
     Args:
         mensaje: El mensaje nuevo del usuario
         historial: Lista de mensajes anteriores [{"role": "user/assistant", "content": "..."}]
+        contexto_extra: Instrucciones adicionales para esta respuesta (ej: saludo del día)
 
     Returns:
         La respuesta generada
@@ -121,6 +122,8 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
         return obtener_mensaje_fallback()
 
     system_prompt = cargar_system_prompt()
+    if contexto_extra:
+        system_prompt += f"\n\n## Contexto de esta respuesta\n{contexto_extra}"
 
     # Filtrar SILENCIO del historial antes de enviarlo a la IA
     mensajes = [
