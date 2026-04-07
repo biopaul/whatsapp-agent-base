@@ -163,8 +163,8 @@ async def webhook_handler(request: Request):
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
             # Mostrar "está escribiendo..." y simular tiempo de escritura
-            await proveedor.indicar_escribiendo(msg.telefono)
-            delay = min(len(respuesta) * 0.025, 5.0)  # ~25ms por caracter, máx 5s
+            delay = max(1, min(round(len(respuesta) * 0.025), 5))  # 1–5s según longitud
+            await proveedor.indicar_escribiendo(msg.telefono, delay)
             await asyncio.sleep(delay)
 
             await proveedor.enviar_mensaje(msg.telefono, respuesta)

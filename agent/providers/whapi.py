@@ -31,7 +31,7 @@ class ProveedorWhapi(ProveedorWhatsApp):
             ))
         return mensajes
 
-    async def indicar_escribiendo(self, telefono: str) -> None:
+    async def indicar_escribiendo(self, telefono: str, delay: int = 3) -> None:
         """Muestra el indicador '...' en WhatsApp mientras el agente procesa."""
         if not self.token:
             return
@@ -39,12 +39,15 @@ class ProveedorWhapi(ProveedorWhatsApp):
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
-        # Whapi espera solo el número en la URL, sin el sufijo @s.whatsapp.net
         chat_id_limpio = telefono.split("@")[0]
         url = self.url_presencia.format(chat_id=chat_id_limpio)
         async with httpx.AsyncClient() as client:
             try:
-                r = await client.put(url, json={"presence": "composing"}, headers=headers)
+                r = await client.put(
+                    url,
+                    json={"presence": "typing", "delay": delay},
+                    headers=headers,
+                )
                 if r.status_code not in (200, 201):
                     logger.info(f"indicar_escribiendo: {r.status_code} — {r.text}")
             except Exception as e:
