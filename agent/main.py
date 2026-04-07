@@ -33,6 +33,7 @@ logger = logging.getLogger("agentkit")
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
 NOTIFY_PHONE = os.getenv("NOTIFY_PHONE", "")
+NOTIFY_NAME = os.getenv("NOTIFY_NAME", "")
 
 KEYWORDS_ESCALAR = [
     "quiero hablar con",
@@ -97,7 +98,8 @@ async def _enviar_alerta_humano(telefono: str, motivo: str) -> None:
         return
     numero_limpio = telefono.split("@")[0]
     link = f"https://wa.me/{numero_limpio}"
-    alerta = f"*Atención requerida*\n\n{motivo}\n\n{link}"
+    saludo = f"*{NOTIFY_NAME}, atención requerida* 👋" if NOTIFY_NAME else "*Atención requerida*"
+    alerta = f"{saludo}\n\n{motivo}\n\n{link}"
     try:
         await proveedor.enviar_mensaje(NOTIFY_PHONE, alerta)
     except Exception as e:

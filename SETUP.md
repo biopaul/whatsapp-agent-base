@@ -52,6 +52,7 @@ Luego en Railway:
 | `WHATSAPP_PROVIDER` | `whapi` / `meta` / `twilio` |
 | `WHAPI_TOKEN` | token del canal Whapi |
 | `NOTIFY_PHONE` | número que recibe alertas de escalado (sin `+`, ej: `5491155554444`) |
+| `NOTIFY_NAME` | nombre de la persona que recibe las alertas (ej: `Nani`) |
 | `PORT` | `8000` |
 | `ENVIRONMENT` | `production` |
 
