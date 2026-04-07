@@ -51,6 +51,7 @@ Luego en Railway:
 | `ANTHROPIC_API_KEY` | key del cliente o compartida |
 | `WHATSAPP_PROVIDER` | `whapi` / `meta` / `twilio` |
 | `WHAPI_TOKEN` | token del canal Whapi |
+| `NOTIFY_PHONE` | número que recibe alertas de escalado (sin `+`, ej: `5491155554444`) |
 | `PORT` | `8000` |
 | `ENVIRONMENT` | `production` |
 

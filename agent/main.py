@@ -32,6 +32,23 @@ logger = logging.getLogger("agentkit")
 
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
+NOTIFY_PHONE = os.getenv("NOTIFY_PHONE", "")
+
+KEYWORDS_ESCALAR = [
+    "quiero hablar con",
+    "hablar con alguien",
+    "hablar con una persona",
+    "hablar con un humano",
+    "hablar con alguien del equipo",
+    "con un asesor",
+    "con el dueño",
+    "con el encargado",
+    "me comunicas con",
+    "me pasas con",
+    "quiero un humano",
+    "llamame",
+    "llamar a alguien",
+]
 
 def _silencios_consecutivos(historial: list[dict]) -> int:
     """Cuenta cuántos mensajes consecutivos del asistente son SILENCIO al final del historial."""
@@ -66,6 +83,25 @@ def _saludo_por_hora() -> str:
         return "Buenas tardes"
     else:
         return "Buenas noches"
+
+
+def _detectar_keyword_escalar(texto: str) -> bool:
+    """Detecta frases que indican que el cliente quiere atención humana."""
+    texto_lower = texto.lower()
+    return any(kw in texto_lower for kw in KEYWORDS_ESCALAR)
+
+
+async def _enviar_alerta_humano(telefono: str, motivo: str) -> None:
+    """Envía alerta al número configurado en NOTIFY_PHONE con el motivo y link al chat."""
+    if not NOTIFY_PHONE:
+        return
+    numero_limpio = telefono.split("@")[0]
+    link = f"https://wa.me/{numero_limpio}"
+    alerta = f"*Atención requerida*\n\n{motivo}\n\n{link}"
+    try:
+        await proveedor.enviar_mensaje(NOTIFY_PHONE, alerta)
+    except Exception as e:
+        logger.error(f"Error enviando alerta a humano: {e}")
 
 
 async def _es_nueva_sesion(telefono: str) -> bool:
@@ -144,6 +180,19 @@ async def webhook_handler(request: Request):
                 logger.info(f"Pre-bloqueado {msg.telefono} ({_silencios_consecutivos(historial)} silencios consecutivos)")
                 continue
 
+            # Escalado por keyword — el cliente pide explícitamente un humano
+            if _detectar_keyword_escalar(msg.texto):
+                respuesta = "¡Claro! Te conecto con alguien del equipo ahora mismo."
+                await guardar_mensaje(msg.telefono, "user", msg.texto)
+                await guardar_mensaje(msg.telefono, "assistant", respuesta)
+                delay = max(1, min(round(len(respuesta) * 0.025), 5))
+                await proveedor.indicar_escribiendo(msg.telefono, delay)
+                await asyncio.sleep(delay)
+                await proveedor.enviar_mensaje(msg.telefono, respuesta)
+                await _enviar_alerta_humano(msg.telefono, "El cliente pide hablar con un humano")
+                logger.info(f"Escalado por keyword: {msg.telefono}")
+                continue
+
             # Detectar si es nueva sesión (nuevo día) y armar saludo
             contexto = ""
             if await _es_nueva_sesion(msg.telefono):
@@ -159,6 +208,13 @@ async def webhook_handler(request: Request):
                 logger.info(f"Silencio activado para {msg.telefono}")
                 continue
 
+            # Detectar señal de escalado: ESCALAR: <motivo>\n<mensaje al cliente>
+            motivo_escalar = None
+            if respuesta.startswith("ESCALAR:"):
+                primera_linea, _, resto = respuesta.partition("\n")
+                motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
+                respuesta = resto.strip()
+
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
@@ -169,6 +225,10 @@ async def webhook_handler(request: Request):
 
             await proveedor.enviar_mensaje(msg.telefono, respuesta)
             logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
+
+            if motivo_escalar:
+                await _enviar_alerta_humano(msg.telefono, motivo_escalar)
+                logger.info(f"Alerta de escalado enviada: {motivo_escalar}")
 
         return {"status": "ok"}
 
