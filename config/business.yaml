@@ -4,15 +4,28 @@
 negocio:
   nombre: "[NOMBRE DEL NEGOCIO]"
   descripcion: "[DESCRIPCIÓN DETALLADA — qué ofrece, a quién, cómo]"
-  horario: "[HORARIO DE ATENCIÓN]"
   sitio_web: "[URL DEL SITIO WEB]"
 
 agente:
   nombre: "[NOMBRE DEL AGENTE]"
   tono: "[TONO — ej: cercano y profesional, formal, amigable]"
+  # Función principal del agente — elegir una o indicar combinación:
+  # ventas | soporte | atencion_cliente | post_venta | reservas | cobranzas | onboarding | mixto
+  funcion_principal: "[FUNCIÓN]"
+  descripcion_funcion: "[Descripción de qué debe hacer el agente — ej: captar leads y guiar al cierre]"
   casos_de_uso:
     - "[CASO DE USO 1]"
     - "[CASO DE USO 2]"
+
+horario:
+  # Tipo de cobertura: 24h (sin restricción) o especifico (con días y horas)
+  tipo: "[24h | especifico]"
+  # Solo completar si tipo = especifico
+  dias: "[todos | lunes a viernes | lunes a sabado | personalizado]"
+  hora_inicio: "[ej: 09:00]"
+  hora_fin: "[ej: 18:00]"
+  zona_horaria: "[ej: America/Argentina/Buenos_Aires]"
+  mensaje_fuera_de_horario: "[Mensaje que envía el agente cuando alguien escribe fuera del horario]"
 
 metadata:
   creado: "[FECHA]"
