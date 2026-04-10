@@ -63,28 +63,6 @@ Podés subir cualquier documento relevante a la carpeta `/knowledge`: menús, li
 
 ---
 
-**¿Cuál es el proveedor de WhatsApp a usar?**
-Elegir uno:
-
-| Opción | Descripción |
-|--------|-------------|
-| `whapi` | **Recomendado.** Whapi.cloud — el más fácil de configurar, sandbox gratis, no requiere verificación de negocio |
-| `meta` | Meta Cloud API — API oficial de WhatsApp, gratuita por conversación, requiere cuenta de Facebook Business verificada |
-| `twilio` | Twilio — muy confiable y con buena documentación, más costoso pero robusto |
-
-Según el proveedor elegido, obtener las credenciales correspondientes:
-- **Whapi:** token de API desde el dashboard en whapi.cloud
-- **Meta:** Access Token permanente + Phone Number ID + Verify Token (desde developers.facebook.com)
-- **Twilio:** Account SID + Auth Token + número de WhatsApp asignado (desde console.twilio.com)
-
----
-
-**¿Cuál es la Anthropic API Key del cliente?**
-La key empieza con `sk-ant-...` y se obtiene desde [platform.anthropic.com](https://platform.anthropic.com) → Settings → API Keys.
-- Si el cliente usa la key compartida del servicio, anotarla igual — va en la variable `ANTHROPIC_API_KEY` del `.env`
-
----
-
 Con esas respuestas, completar:
 
 **`config/business.yaml`** — datos estructurados del negocio y configuración de horario
