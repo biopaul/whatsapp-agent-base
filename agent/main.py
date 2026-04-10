@@ -201,6 +201,12 @@ async def webhook_handler(request: Request):
                 saludo = _saludo_por_hora()
                 contexto = f"Es el primer mensaje del día de este cliente. Comenzá tu respuesta con '{saludo}' de forma natural, integrado en tu mensaje (no como fórmula aislada)."
 
+            # Indicar profundidad de conversación para calibrar largo de respuesta
+            turnos = len([m for m in historial if m["role"] == "user"])
+            if turnos >= 3:
+                profundidad = f"Ya llevan {turnos} intercambios. Sé conciso y directo — respondé solo lo que se pregunta."
+                contexto = f"{contexto}\n{profundidad}".strip() if contexto else profundidad
+
             respuesta = await generar_respuesta(msg.texto, historial, contexto)
 
             # Si Claude indica silencio, guardar en DB y no enviar
