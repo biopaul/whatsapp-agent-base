@@ -12,9 +12,9 @@ Configurar en .env:
 """
 
 import os
-import yaml
 import logging
 from dotenv import load_dotenv
+from agent.config_loader import get_system_prompt, get_fallback_message, get_error_message
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
@@ -31,29 +31,16 @@ _MODELOS_DEFAULT = {
 AI_MODEL = os.getenv("AI_MODEL", _MODELOS_DEFAULT.get(AI_PROVIDER, ""))
 
 
-def cargar_config_prompts() -> dict:
-    """Lee toda la configuración desde config/prompts.yaml."""
-    try:
-        with open("config/prompts.yaml", "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        logger.error("config/prompts.yaml no encontrado")
-        return {}
-
-
 def cargar_system_prompt() -> str:
-    config = cargar_config_prompts()
-    return config.get("system_prompt", "Sos una asistente útil. Respondé en español.")
+    return get_system_prompt()
 
 
 def obtener_mensaje_error() -> str:
-    config = cargar_config_prompts()
-    return config.get("error_message", "Lo siento, estoy teniendo un problema técnico. Por favor intentá de nuevo en unos minutos.")
+    return get_error_message()
 
 
 def obtener_mensaje_fallback() -> str:
-    config = cargar_config_prompts()
-    return config.get("fallback_message", "Disculpá, no entendí tu mensaje. ¿Podés reformularlo?")
+    return get_fallback_message()
 
 
 async def _responder_claude(system_prompt: str, mensajes: list[dict]) -> str:

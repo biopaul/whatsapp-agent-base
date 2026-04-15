@@ -18,10 +18,7 @@ from dotenv import load_dotenv
 from agent.brain import generar_respuesta
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp
 from agent.providers import obtener_proveedor
-
-# Zona horaria configurable — default: Argentina (GMT-3)
-TZ_OFFSET = int(os.getenv("TZ_OFFSET", "-3"))
-TZ_LOCAL = timezone(timedelta(hours=TZ_OFFSET))
+from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, invalidate_cache
 
 load_dotenv()
 
@@ -32,8 +29,6 @@ logger = logging.getLogger("agentkit")
 
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
-NOTIFY_PHONE = os.getenv("NOTIFY_PHONE", "")
-NOTIFY_NAME = os.getenv("NOTIFY_NAME", "")
 
 KEYWORDS_ESCALAR = [
     "quiero hablar con",
@@ -76,8 +71,9 @@ def _debe_prebloquear(historial: list[dict]) -> bool:
 
 
 def _saludo_por_hora() -> str:
-    """Retorna el saludo apropiado según la hora local configurada."""
-    hora = datetime.now(TZ_LOCAL).hour
+    """Retorna el saludo apropiado segun la hora local configurada."""
+    tz_local = timezone(timedelta(hours=get_tz_offset()))
+    hora = datetime.now(tz_local).hour
     if 6 <= hora < 12:
         return "Buen día"
     elif 12 <= hora < 20:
@@ -93,15 +89,17 @@ def _detectar_keyword_escalar(texto: str) -> bool:
 
 
 async def _enviar_alerta_humano(telefono: str, motivo: str) -> None:
-    """Envía alerta al número configurado en NOTIFY_PHONE con el motivo y link al chat."""
-    if not NOTIFY_PHONE:
+    """Envia alerta al numero configurado para escalado humano."""
+    notify_phone = get_notify_phone()
+    if not notify_phone:
         return
+    notify_name = get_notify_name()
     numero_limpio = telefono.split("@")[0]
     link = f"https://wa.me/{numero_limpio}"
-    saludo = f"*{NOTIFY_NAME}, atención requerida* 👋" if NOTIFY_NAME else "*Atención requerida*"
+    saludo = f"*{notify_name}, atencion requerida*" if notify_name else "*Atencion requerida*"
     alerta = f"{saludo}\n\n{motivo}\n\n{link}"
     try:
-        await proveedor.enviar_mensaje(NOTIFY_PHONE, alerta)
+        await proveedor.enviar_mensaje(notify_phone, alerta)
     except Exception as e:
         logger.error(f"Error enviando alerta a humano: {e}")
 
@@ -114,8 +112,9 @@ async def _es_nueva_sesion(telefono: str) -> bool:
     ultimo = await obtener_ultimo_timestamp(telefono)
     if ultimo is None:
         return True
-    ahora = datetime.now(TZ_LOCAL)
-    ultimo_local = ultimo.replace(tzinfo=timezone.utc).astimezone(TZ_LOCAL)
+    tz_local = timezone(timedelta(hours=get_tz_offset()))
+    ahora = datetime.now(tz_local)
+    ultimo_local = ultimo.replace(tzinfo=timezone.utc).astimezone(tz_local)
     return ahora.date() != ultimo_local.date()
 
 
@@ -140,6 +139,13 @@ app = FastAPI(
 async def health_check():
     """Endpoint de salud para Railway/monitoreo."""
     return {"status": "ok", "service": "whatsapp-agent"}
+
+
+@app.post("/config/reload")
+async def reload_config():
+    """Invalida cache de config remota para forzar re-fetch."""
+    invalidate_cache()
+    return {"status": "ok", "message": "Config cache invalidated"}
 
 
 @app.post("/webhook/statuses")
