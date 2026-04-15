@@ -19,6 +19,7 @@ from agent.brain import generar_respuesta
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp
 from agent.providers import obtener_proveedor
 from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, invalidate_cache
+from agent.transcriber import procesar_audio
 
 load_dotenv()
 
@@ -181,7 +182,21 @@ async def webhook_handler(request: Request):
         mensajes = await proveedor.parsear_webhook(request)
 
         for msg in mensajes:
-            if msg.es_propio or not msg.texto:
+            if msg.es_propio:
+                continue
+
+            # Transcribir audio si es nota de voz
+            if msg.audio_url and not msg.texto:
+                waha_key = os.getenv("WAHA_API_KEY", "")
+                transcripcion = await procesar_audio(msg.audio_url, waha_key)
+                if transcripcion:
+                    msg.texto = transcripcion
+                    logger.info(f"Audio transcripto de {msg.telefono}: {msg.texto[:80]}")
+                else:
+                    logger.warning(f"No se pudo transcribir audio de {msg.telefono}")
+                    continue
+
+            if not msg.texto:
                 continue
 
             logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")

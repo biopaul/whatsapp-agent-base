@@ -35,23 +35,48 @@ class ProveedorWAHA(ProveedorWhatsApp):
         """Parsea el payload de WAHA (un evento por request)."""
         body = await request.json()
 
-        # WAHA envía un evento por request, no un array
         evento = body.get("event", "")
         if evento not in ("message", "message.any"):
             return []
 
         payload = body.get("payload", {})
+        es_propio = payload.get("fromMe", False)
+        telefono = payload.get("from", "")
+        mensaje_id = payload.get("id", "")
 
-        # Ignorar mensajes sin body (imágenes, stickers, etc.)
+        # Audio / nota de voz — detectar por hasMedia + mimetype
+        has_media = payload.get("hasMedia", False)
+        media = payload.get("media") or {}
+        mimetype = media.get("mimetype", "")
+
+        if has_media:
+            logger.info(f"WAHA hasMedia=true de {telefono} | mimetype={mimetype!r} | media_keys={list(media.keys())} | id={mensaje_id}")
+
+        if has_media and mimetype.startswith("audio/"):
+            media_url = media.get("url", "")
+            if not media_url:
+                media_url = f"{self.base_url}/api/{self.session}/messages/{mensaje_id}/download"
+            logger.info(f"Audio detectado de {telefono}: {mimetype} -> {media_url[:120]}")
+            return [MensajeEntrante(
+                telefono=telefono,
+                texto="",
+                mensaje_id=mensaje_id,
+                es_propio=es_propio,
+                audio_url=media_url,
+            )]
+
+        # Mensajes de texto
         texto = payload.get("body", "")
+        if not texto and has_media:
+            logger.info(f"WAHA media no-audio ignorado de {telefono}: mimetype={mimetype!r}")
         if not texto:
             return []
 
         return [MensajeEntrante(
-            telefono=payload.get("from", ""),
+            telefono=telefono,
             texto=texto,
-            mensaje_id=payload.get("id", ""),
-            es_propio=payload.get("fromMe", False),
+            mensaje_id=mensaje_id,
+            es_propio=es_propio,
         )]
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:

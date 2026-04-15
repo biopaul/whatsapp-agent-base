@@ -23,6 +23,21 @@ class ProveedorWhapi(ProveedorWhatsApp):
         body = await request.json()
         mensajes = []
         for msg in body.get("messages", []):
+            msg_type = msg.get("type", "text")
+
+            # Audio / nota de voz
+            if msg_type in ("audio", "voice", "ptt"):
+                audio_data = msg.get("audio", msg.get("voice", {}))
+                audio_url = audio_data.get("link", "") if isinstance(audio_data, dict) else ""
+                mensajes.append(MensajeEntrante(
+                    telefono=msg.get("chat_id", ""),
+                    texto="",
+                    mensaje_id=msg.get("id", ""),
+                    es_propio=msg.get("from_me", False),
+                    audio_url=audio_url,
+                ))
+                continue
+
             mensajes.append(MensajeEntrante(
                 telefono=msg.get("chat_id", ""),
                 texto=msg.get("text", {}).get("body", ""),

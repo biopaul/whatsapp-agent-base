@@ -15,6 +15,7 @@ import os
 import logging
 from dotenv import load_dotenv
 from agent.config_loader import get_system_prompt, get_fallback_message, get_error_message
+from agent.knowledge_loader import get_knowledge_text
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
@@ -109,6 +110,12 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
         return obtener_mensaje_fallback()
 
     system_prompt = cargar_system_prompt()
+
+    # Incluir documentos de conocimiento subidos en WP
+    knowledge = get_knowledge_text()
+    if knowledge:
+        system_prompt += f"\n\n## Documentos de referencia\n\n{knowledge}"
+
     if contexto_extra:
         system_prompt += f"\n\n## Contexto de esta respuesta\n{contexto_extra}"
 
