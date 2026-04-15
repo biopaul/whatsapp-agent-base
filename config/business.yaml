@@ -30,4 +30,4 @@ horario:
 metadata:
   creado: "[FECHA]"
   version: "1.0"
-  proveedor_whatsapp: "[whapi | meta | twilio]"
+  proveedor_whatsapp: "[whapi | meta | twilio | waha]"
