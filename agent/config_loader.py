@@ -1,10 +1,12 @@
 # agent/config_loader.py — Carga config remota desde WP REST API con cache y fallback local
 
 import os
+import re
 import time
 import logging
 import yaml
 import httpx
+from html import unescape
 
 logger = logging.getLogger("agentkit")
 
@@ -106,8 +108,28 @@ def get_config() -> dict:
     return config
 
 
+def _html_to_text(html: str) -> str:
+    """Convierte HTML simple del editor WP a texto plano legible por la IA."""
+    if "<" not in html:
+        return html
+    text = html
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"</p>\s*<p[^>]*>", "\n\n", text)
+    text = re.sub(r"</?p[^>]*>", "\n", text)
+    text = re.sub(r"<li[^>]*>", "- ", text)
+    text = re.sub(r"</li>", "\n", text)
+    text = re.sub(r"</?[uo]l[^>]*>", "\n", text)
+    text = re.sub(r"<strong[^>]*>(.*?)</strong>", r"**\1**", text)
+    text = re.sub(r"<em[^>]*>(.*?)</em>", r"*\1*", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def get_system_prompt() -> str:
-    return get_config().get("prompts", {}).get("system_prompt", "")
+    raw = get_config().get("prompts", {}).get("system_prompt", "")
+    return _html_to_text(raw)
 
 
 def get_fallback_message() -> str:
