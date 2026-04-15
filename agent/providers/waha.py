@@ -56,6 +56,10 @@ class ProveedorWAHA(ProveedorWhatsApp):
             media_url = media.get("url", "")
             if not media_url:
                 media_url = f"{self.base_url}/api/{self.session}/messages/{mensaje_id}/download"
+            else:
+                # WAHA reporta URLs con localhost — reescribir a la URL publica.
+                import re
+                media_url = re.sub(r'^https?://localhost(:\d+)?', self.base_url, media_url)
             logger.info(f"Audio detectado de {telefono}: {mimetype} -> {media_url[:120]}")
             return [MensajeEntrante(
                 telefono=telefono,
