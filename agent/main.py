@@ -141,6 +141,13 @@ async def health_check():
     return {"status": "ok", "service": "whatsapp-agent"}
 
 
+@app.get("/config")
+async def get_current_config():
+    """Devuelve la config activa del agente (para pre-popular el form de WP)."""
+    from agent.config_loader import get_config
+    return get_config()
+
+
 @app.post("/config/reload")
 async def reload_config():
     """Invalida cache de config remota para forzar re-fetch."""
