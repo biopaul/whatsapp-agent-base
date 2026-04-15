@@ -93,22 +93,31 @@ gh repo create [nombre-repo] --private --source=. --remote=origin --push
 Luego en Railway:
 - New Project → Deploy from GitHub
 - Agregar variables de entorno (ver `.env.example`)
-- Generar dominio público (Settings → Networking)
-- Configurar webhook en Whapi/Meta/Twilio con la URL generada
+- Generar dominio publico (Settings → Networking)
+- Configurar sesion WAHA con webhook apuntando a la URL generada (o configurar webhook en Whapi/Meta/Twilio si se usa otro proveedor)
 
 ## Variables de entorno en Railway
 
 | Variable | Valor |
 |----------|-------|
 | `ANTHROPIC_API_KEY` | key del cliente o compartida |
-| `WHATSAPP_PROVIDER` | `whapi` / `meta` / `twilio` |
-| `WHAPI_TOKEN` | token del canal Whapi |
-| `NOTIFY_PHONE` | número que recibe alertas de escalado (sin `+`, ej: `5491155554444`) |
+| `WHATSAPP_PROVIDER` | `waha` (default) / `whapi` / `meta` / `twilio` |
+| `WAHA_BASE_URL` | URL publica de tu instancia WAHA |
+| `WAHA_API_KEY` | API key de WAHA |
+| `WAHA_SESSION` | nombre de la sesion WAHA asignada al cliente |
+| `NOTIFY_PHONE` | numero que recibe alertas de escalado (sin `+`, ej: `5491155554444`) |
 | `NOTIFY_NAME` | nombre de la persona que recibe las alertas (ej: `Nani`) |
 | `PORT` | `8000` |
 | `ENVIRONMENT` | `production` |
 
-## Webhook Whapi
+## Webhook WAHA
 
-URL: `https://[dominio-railway]/webhook`
-Modo: Method → activar `messages.post`
+El webhook se configura al crear/actualizar la sesion WAHA. La URL debe ser:
+
+```
+https://[dominio-railway]/webhook
+```
+
+Eventos: `message`
+
+Si se usa otro proveedor (Whapi, Meta, Twilio), configurar el webhook segun la documentacion de cada uno.
