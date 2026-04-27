@@ -6,16 +6,35 @@ import time
 import logging
 import yaml
 import httpx
+from datetime import datetime, timedelta, timezone
 from html import unescape
 
 logger = logging.getLogger("agentkit")
 
 CONFIG_URL = os.getenv("CONFIG_URL", "")
-CACHE_TTL = int(os.getenv("CONFIG_CACHE_TTL", "300"))
+
+# TTL corto (60s) para capturar cambios de plan/pausa rapidamente.
+# Ajustable via env var si se necesita mas agresividad o menos carga.
+CACHE_TTL = int(os.getenv("CONFIG_CACHE_TTL", "60"))
 
 _cache: dict | None = None
 _cache_ts: float = 0.0
 _local_config: dict | None = None
+
+# Estado de pausa en memoria — actualizable inmediatamente desde /usage
+# sin esperar al proximo GET /config.
+_agent_paused: bool = False
+_pause_reason: str | None = None
+
+# Modelos por defecto para cada tier (OpenRouter model IDs).
+_DEFAULT_MODELS_QUICK = [
+    "anthropic/claude-3-5-haiku",
+    "openai/gpt-4o-mini",
+]
+_DEFAULT_MODELS_FULL = [
+    "anthropic/claude-3-5-sonnet",
+    "openai/gpt-4o",
+]
 
 
 def _fetch_remote() -> dict | None:
@@ -26,9 +45,11 @@ def _fetch_remote() -> dict | None:
             resp = client.get(CONFIG_URL)
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("$schema") == "config-v1":
+            # Aceptar ambos schemas: config-v1 (actual) y config-v2 (nuevo con planes)
+            schema = data.get("$schema", "")
+            if schema in ("config-v1", "config-v2") or "system_prompt" in data or "prompts" in data:
                 return data
-            logger.warning(f"Remote config: schema desconocido {data.get('$schema')}")
+            logger.warning(f"Remote config: schema desconocido {schema!r}")
             return None
         logger.warning(f"Remote config: HTTP {resp.status_code}")
         return None
@@ -81,7 +102,7 @@ def _load_local_yaml() -> dict:
 
 def get_config() -> dict:
     """Config actual con cache. Prioridad: remoto > local YAML > defaults."""
-    global _cache, _cache_ts, _local_config
+    global _cache, _cache_ts, _local_config, _agent_paused, _pause_reason
 
     now = time.time()
     if _cache is not None and (now - _cache_ts) < CACHE_TTL:
@@ -103,10 +124,47 @@ def get_config() -> dict:
     if os.getenv("TZ_OFFSET"):
         config.setdefault("timezone", {})["tz_offset"] = int(os.getenv("TZ_OFFSET"))
 
+    # Sincronizar estado de pausa desde el config remoto
+    if "agent_paused" in config:
+        _agent_paused = bool(config["agent_paused"])
+        _pause_reason = config.get("pause_reason")
+        if _agent_paused:
+            logger.info(f"Config: agente pausado — razon={_pause_reason!r}")
+
     _cache = config
     _cache_ts = now
     return config
 
+
+# ---------------------------------------------------------------------------
+# Pausa suave — actualizable sin esperar TTL (se llama desde usage_reporter)
+# ---------------------------------------------------------------------------
+
+def set_paused_state(paused: bool, reason: str | None = None) -> None:
+    """Actualiza el estado de pausa en memoria de forma inmediata."""
+    global _agent_paused, _pause_reason
+    if paused and not _agent_paused:
+        logger.warning(f"Agente pausado inmediatamente por respuesta /usage — razon={reason!r}")
+    elif not paused and _agent_paused:
+        logger.info("Agente reactivado via set_paused_state")
+    _agent_paused = paused
+    _pause_reason = reason
+
+
+def is_agent_paused() -> bool:
+    """True si el agente debe ignorar mensajes entrantes (soft pause)."""
+    # Refrescar config si el cache expiro (sin bloquear)
+    get_config()
+    return _agent_paused
+
+
+def get_pause_reason() -> str | None:
+    return _pause_reason
+
+
+# ---------------------------------------------------------------------------
+# Helpers de configuracion
+# ---------------------------------------------------------------------------
 
 def _html_to_text(html: str) -> str:
     """Convierte HTML simple del editor WP a texto plano legible por la IA."""
@@ -128,16 +186,20 @@ def _html_to_text(html: str) -> str:
 
 
 def get_system_prompt() -> str:
-    raw = get_config().get("prompts", {}).get("system_prompt", "")
+    cfg = get_config()
+    # Nuevo schema: system_prompt a nivel raiz
+    raw = cfg.get("system_prompt") or cfg.get("prompts", {}).get("system_prompt", "")
     return _html_to_text(raw)
 
 
 def get_fallback_message() -> str:
-    return get_config().get("prompts", {}).get("fallback_message", "Disculpa, no entendi.")
+    cfg = get_config()
+    return cfg.get("prompts", {}).get("fallback_message", "Disculpa, no entendi.")
 
 
 def get_error_message() -> str:
-    return get_config().get("prompts", {}).get("error_message", "Problema tecnico.")
+    cfg = get_config()
+    return cfg.get("prompts", {}).get("error_message", "Problema tecnico.")
 
 
 def get_notify_phone() -> str:
@@ -149,7 +211,118 @@ def get_notify_name() -> str:
 
 
 def get_tz_offset() -> int:
-    return get_config().get("timezone", {}).get("tz_offset", -3)
+    """Offset en horas. Fallback a TZ_OFFSET env si no hay config remota."""
+    cfg = get_config()
+    tz = cfg.get("timezone", {})
+    # Nuevo schema: timezone es string (IANA). Viejo: dict con tz_offset.
+    if isinstance(tz, dict):
+        return tz.get("tz_offset", int(os.getenv("TZ_OFFSET", "-3")))
+    # Si es string IANA, intentar con zoneinfo; caer a env si falla
+    if isinstance(tz, str) and tz:
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(tz))
+            return int(now.utcoffset().total_seconds() // 3600)
+        except Exception:
+            pass
+    return int(os.getenv("TZ_OFFSET", "-3"))
+
+
+def get_ai_models() -> dict:
+    """
+    Retorna listas de modelos OpenRouter para cada tier: quick y full.
+    Prioridad: config remoto > defaults hardcoded.
+    """
+    cfg = get_config()
+    quick = cfg.get("models_quick") or []
+    full = cfg.get("models_full") or []
+
+    if not quick and not full:
+        legacy = (cfg.get("ai_model") or os.getenv("AI_MODEL", "")).strip()
+        if legacy:
+            quick = [legacy]
+            full = [legacy]
+
+    return {
+        "quick": quick if quick else _DEFAULT_MODELS_QUICK,
+        "full": full if full else _DEFAULT_MODELS_FULL,
+    }
+
+
+def get_ai_model() -> str:
+    """Backward compat: retorna el primer modelo full configurado."""
+    return get_ai_models()["full"][0]
+
+
+def get_capabilities() -> dict:
+    """
+    Retorna las capacidades habilitadas del agente.
+    Defaults seguros: capabilities de texto on, media off (requieren config explicita).
+    """
+    defaults = {
+        # Ya existentes
+        "reactions":      True,
+        "read_receipts":  True,
+        # Nuevas — off por default hasta que el plan las habilite
+        "audio_receive":  True,   # backward compat: ya teniamos audio
+        "audio_send":     False,
+        "image_receive":  False,
+        "image_send":     False,
+        "stickers":       False,
+    }
+    caps = get_config().get("capabilities", {})
+    return {k: bool(caps.get(k, v)) for k, v in defaults.items()}
+
+
+def get_limits() -> dict:
+    """Retorna los limites del plan actual. 0 = sin limite."""
+    defaults: dict = {
+        "max_messages_month": 0,
+        "max_chats_month":    0,
+        "max_storage_mb":     0,
+        "messages_used":      0,
+        "chats_used":         0,
+        "storage_used_bytes": 0,
+        "period_start":       None,
+        "period_end":         None,
+    }
+    limits = get_config().get("limits", {})
+    return {**defaults, **{k: limits[k] for k in defaults if k in limits}}
+
+
+def get_hours_slots() -> list[bool]:
+    """
+    Retorna lista de 24 booleanos desde business.hours_slots del config remoto.
+    Fallback: todos True (24/7).
+    """
+    slots = get_config().get("business", {}).get("hours_slots")
+    if (
+        isinstance(slots, list)
+        and len(slots) == 24
+        and all(isinstance(v, bool) for v in slots)
+    ):
+        return slots
+    return [True] * 24
+
+
+def is_within_business_hours() -> bool:
+    """True si la hora actual (segun tz del config) esta dentro del horario habilitado."""
+    slots = get_hours_slots()
+    tz_off = get_tz_offset()
+    now_local = datetime.now(timezone(timedelta(hours=tz_off)))
+    return slots[now_local.hour]
+
+
+def get_out_of_hours_message() -> str:
+    hours_str = get_config().get("business", {}).get("hours", "").strip()
+    if hours_str:
+        return f"Estamos fuera de horario de atencion. Nuestro horario es: {hours_str}. Deja tu consulta y te respondemos pronto."
+    return "Estamos fuera de horario de atencion automatica. Deja tu consulta y te respondemos pronto."
+
+
+def get_config_updated_at() -> str | None:
+    """Fecha/hora de la ultima actualizacion de config en WP (UTC, formato MySQL)."""
+    return get_config().get("config_updated_at") or None
 
 
 def invalidate_cache() -> None:

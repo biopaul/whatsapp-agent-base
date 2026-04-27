@@ -41,3 +41,19 @@ class ProveedorWhatsApp(ABC):
     async def indicar_escribiendo(self, telefono: str, delay: int = 3) -> None:
         """Muestra el indicador de escritura ('...') al cliente. Opcional por proveedor."""
         pass
+
+    async def indicar_grabando(self, telefono: str) -> None:
+        """Muestra el indicador de grabacion de audio al cliente. Opcional."""
+        pass
+
+    async def marcar_leido(self, telefono: str) -> None:
+        """Marca mensajes del chat como leidos (ticks azules). Opcional."""
+        pass
+
+    async def reaccionar(self, telefono: str, mensaje_id: str, emoji: str) -> None:
+        """Envia una reaccion emoji a un mensaje especifico. Opcional."""
+        pass
+
+    async def enviar_archivo(self, telefono: str, url: str, filename: str, caption: str = "") -> bool:
+        """Envia un archivo (PDF, DOCX, etc.) al cliente. Retorna True si fue exitoso."""
+        return False

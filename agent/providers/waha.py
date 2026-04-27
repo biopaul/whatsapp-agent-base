@@ -108,17 +108,85 @@ class ProveedorWAHA(ProveedorWhatsApp):
                 logger.error(f"Error WAHA enviar: {e}")
                 return False
 
-    async def indicar_escribiendo(self, telefono: str, delay: int = 3) -> None:
-        """Muestra el indicador 'escribiendo...' via WAHA."""
+    async def _set_presence(self, telefono: str, presence: str) -> None:
+        """Envia un estado de presencia al chat."""
         chat_id = _asegurar_chat_id(telefono)
         async with httpx.AsyncClient() as client:
             try:
                 r = await client.post(
                     f"{self.base_url}/api/{self.session}/presence",
-                    json={"chatId": chat_id, "presence": "typing"},
+                    json={"chatId": chat_id, "presence": presence},
                     headers=self._headers(),
                 )
                 if r.status_code not in (200, 201):
-                    logger.info(f"indicar_escribiendo WAHA: {r.status_code} — {r.text}")
+                    logger.info(f"presence={presence} WAHA: {r.status_code} — {r.text}")
             except Exception as e:
-                logger.info(f"indicar_escribiendo WAHA falló (no crítico): {e}")
+                logger.info(f"presence={presence} WAHA fallo (no critico): {e}")
+
+    async def indicar_escribiendo(self, telefono: str, delay: int = 3) -> None:
+        await self._set_presence(telefono, "typing")
+
+    async def indicar_grabando(self, telefono: str) -> None:
+        await self._set_presence(telefono, "recording")
+
+    async def marcar_leido(self, telefono: str) -> None:
+        """Marca mensajes del chat como leidos (ticks azules)."""
+        chat_id = _asegurar_chat_id(telefono)
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/{self.session}/chats/{chat_id}/messages/read",
+                    json={},
+                    headers=self._headers(),
+                )
+                if r.status_code not in (200, 201):
+                    logger.info(f"marcar_leido WAHA: {r.status_code} — {r.text}")
+            except Exception as e:
+                logger.info(f"marcar_leido WAHA fallo (no critico): {e}")
+
+    async def enviar_archivo(self, telefono: str, url: str, filename: str, caption: str = "") -> bool:
+        """Envia un archivo al cliente via WAHA POST /api/sendFile."""
+        chat_id = _asegurar_chat_id(telefono)
+        payload: dict = {
+            "session": self.session,
+            "chatId": chat_id,
+            "file": {"url": url},
+        }
+        if caption:
+            payload["caption"] = caption
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/sendFile",
+                    json=payload,
+                    headers=self._headers(),
+                    timeout=30.0,
+                )
+                if r.status_code not in (200, 201):
+                    logger.error(f"enviar_archivo WAHA: {r.status_code} — {r.text}")
+                    return False
+                logger.info(f"Archivo enviado a {telefono}: {filename}")
+                return True
+            except Exception as e:
+                logger.error(f"enviar_archivo WAHA fallo: {e}")
+                return False
+
+    async def reaccionar(self, telefono: str, mensaje_id: str, emoji: str) -> None:
+        """Envia una reaccion emoji a un mensaje."""
+        chat_id = _asegurar_chat_id(telefono)
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/reaction",
+                    json={
+                        "session": self.session,
+                        "chatId": chat_id,
+                        "messageId": mensaje_id,
+                        "reaction": emoji,
+                    },
+                    headers=self._headers(),
+                )
+                if r.status_code not in (200, 201):
+                    logger.info(f"reaccionar WAHA: {r.status_code} — {r.text}")
+            except Exception as e:
+                logger.info(f"reaccionar WAHA fallo (no critico): {e}")

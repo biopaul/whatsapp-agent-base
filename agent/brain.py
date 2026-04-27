@@ -1,142 +1,154 @@
-# agent/brain.py — Cerebro del agente: conexión con la API de IA
+# agent/brain.py — Cerebro del agente: conexion con OpenRouter API
 # WhatsApp Agent Base
 
 """
-Genera respuestas usando el proveedor de IA configurado en .env.
-Soporta: Claude (Anthropic), OpenAI (GPT), Gemini (Google).
-
-Configurar en .env:
-  AI_PROVIDER=claude   → usa ANTHROPIC_API_KEY + modelo configurable
-  AI_PROVIDER=openai   → usa OPENAI_API_KEY + modelo configurable
-  AI_PROVIDER=gemini   → usa GEMINI_API_KEY + modelo configurable
+Logica de IA del agente. Lee el system prompt desde WP config (o YAML local)
+y genera respuestas usando OpenRouter (API compatible con OpenAI).
+Soporta routing de dos niveles: modelo rapido para consultas simples,
+modelo completo para consultas complejas.
 """
 
 import os
 import logging
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agent.config_loader import get_system_prompt, get_fallback_message, get_error_message
-from agent.knowledge_loader import get_knowledge_text
+from agent.config_loader import get_ai_models, get_system_prompt, get_fallback_message, get_error_message
+from agent.knowledge_loader import get_knowledge_text, get_public_docs
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "claude").lower()
+# Cliente OpenRouter (API compatible con OpenAI)
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
 
-# Modelos por defecto para cada proveedor
-_MODELOS_DEFAULT = {
-    "claude": "claude-haiku-4-5-20251001",
-    "openai": "gpt-4o-mini",
-    "gemini": "gemini-2.0-flash",
-}
+# Maximo de tokens por respuesta.
+_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
 
-AI_MODEL = os.getenv("AI_MODEL", _MODELOS_DEFAULT.get(AI_PROVIDER, ""))
+# Capa fija de naturalidad — se antepone a TODOS los system prompts.
+_WHATSAPP_NATURALNESS = """\
+Estas chateando con clientes por WhatsApp. Reglas de comunicacion:
 
+FORMATO
+- Mensajes cortos. Una idea por mensaje.
+- Si tenes mucho para decir, usa --- para separar en mensajes distintos en vez de hacer uno largo.
+- Nunca uses listas con guiones o numeros salvo que el cliente haya pedido una lista explicitamente.
+- Nunca uses negrita (**texto**), italica (*texto*) ni encabezados (## Titulo).
+- Un emoji ocasional esta bien; varios seguidos no.
 
-def cargar_system_prompt() -> str:
-    return get_system_prompt()
+TONO
+- Habla como lo haria una persona real en un chat, no como un documento de ayuda.
+- Nunca empieces un mensaje con "Claro!", "Por supuesto!", "Excelente!", "Perfecto!" ni similares.
+- No repitas lo que el cliente acabo de decir antes de responder.
+- Si la respuesta es corta, que sea corta. No la rellenes para que parezca mas completa.
 
+LARGO
+- 1 a 3 oraciones para preguntas simples.
+- 4 a 6 oraciones maximo para temas complejos.
+- Si necesitas mas espacio, divide con --- en vez de hacer un bloque largo.
 
-def obtener_mensaje_error() -> str:
-    return get_error_message()
-
-
-def obtener_mensaje_fallback() -> str:
-    return get_fallback_message()
-
-
-async def _responder_claude(system_prompt: str, mensajes: list[dict]) -> str:
-    """Genera respuesta usando Anthropic Claude."""
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    response = await client.messages.create(
-        model=AI_MODEL,
-        max_tokens=1024,
-        system=system_prompt,
-        messages=mensajes,
-    )
-    logger.info(f"[Claude] {response.usage.input_tokens} in / {response.usage.output_tokens} out")
-    return response.content[0].text
+"""
 
 
-async def _responder_openai(system_prompt: str, mensajes: list[dict]) -> str:
-    """Genera respuesta usando OpenAI."""
-    from openai import AsyncOpenAI
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    # OpenAI recibe el system prompt como primer mensaje del array
-    messages_openai = [{"role": "system", "content": system_prompt}] + mensajes
-    response = await client.chat.completions.create(
-        model=AI_MODEL,
-        messages=messages_openai,
-        max_tokens=1024,
-    )
-    logger.info(f"[OpenAI] {response.usage.prompt_tokens} in / {response.usage.completion_tokens} out")
-    return response.choices[0].message.content
-
-
-async def _responder_gemini(system_prompt: str, mensajes: list[dict]) -> str:
-    """Genera respuesta usando Google Gemini."""
-    import google.generativeai as genai
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(
-        model_name=AI_MODEL,
-        system_instruction=system_prompt,
-    )
-    # Convertir historial al formato de Gemini
-    historial_gemini = []
-    for msg in mensajes[:-1]:  # todos menos el último (el mensaje actual)
-        historial_gemini.append({
-            "role": "user" if msg["role"] == "user" else "model",
-            "parts": [msg["content"]],
-        })
-    chat = model.start_chat(history=historial_gemini)
-    response = await chat.send_message_async(mensajes[-1]["content"])
-    logger.info(f"[Gemini] respuesta generada")
-    return response.text
+def _es_consulta_compleja(mensaje: str, historial: list[dict]) -> bool:
+    """
+    Heuristica para determinar si el mensaje requiere un modelo mas capaz.
+    Score >= 2 => complejo.
+    """
+    score = 0
+    if len(mensaje) > 150:
+        score += 2
+    if mensaje.count("?") > 1:
+        score += 1
+    turnos = len([m for m in historial if m["role"] == "user"])
+    if turnos > 5:
+        score += 1
+    keywords = [
+        "precio", "costo", "cuanto", "cuánto", "comparar", "diferencia",
+        "mejor", "recomendar", "problema", "error", "explicar", "detalles",
+        "contrato", "condiciones", "garantia",
+    ]
+    if any(kw in mensaje.lower() for kw in keywords):
+        score += 1
+    return score >= 2
 
 
 async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra: str = "") -> str:
     """
-    Genera una respuesta usando el proveedor de IA configurado en AI_PROVIDER.
+    Genera una respuesta usando OpenRouter.
 
     Args:
-        mensaje: El mensaje nuevo del usuario
-        historial: Lista de mensajes anteriores [{"role": "user/assistant", "content": "..."}]
-        contexto_extra: Instrucciones adicionales para esta respuesta (ej: saludo del día)
+        mensaje: El mensaje nuevo del usuario.
+        historial: Lista de mensajes anteriores [{"role": "user/assistant", "content": "..."}].
+        contexto_extra: Instrucciones adicionales para esta respuesta.
 
     Returns:
-        La respuesta generada
+        La respuesta generada por el modelo.
     """
     if not mensaje or len(mensaje.strip()) < 2:
-        return obtener_mensaje_fallback()
+        return get_fallback_message()
 
-    system_prompt = cargar_system_prompt()
+    system_prompt = _WHATSAPP_NATURALNESS + get_system_prompt()
 
-    # Incluir documentos de conocimiento subidos en WP
     knowledge = get_knowledge_text()
     if knowledge:
-        system_prompt += f"\n\n## Documentos de referencia\n\n{knowledge}"
+        system_prompt += f"\n\nDOCUMENTOS DE REFERENCIA\n\n{knowledge}"
+
+    public_docs = get_public_docs()
+    if public_docs:
+        nombres = "\n".join(f"- {d['name']}" for d in public_docs)
+        system_prompt += (
+            "\n\nARCHIVOS QUE PODES ENVIAR AL CLIENTE\n"
+            "Cuando consideres que el cliente se beneficiaria de recibir uno de estos archivos "
+            "(por ejemplo: catalogo, lista de precios, ficha tecnica), podes enviarselo.\n"
+            "Para enviarlo, inclui al FINAL de tu respuesta, en una linea propia, la senal:\n"
+            "ENVIAR_ARCHIVO:<nombre_exacto_del_archivo>\n"
+            "Solo una senal por respuesta. Solo usala si genuinamente agrega valor, no en cada mensaje.\n"
+            f"Archivos disponibles:\n{nombres}"
+        )
 
     if contexto_extra:
-        system_prompt += f"\n\n## Contexto de esta respuesta\n{contexto_extra}"
+        system_prompt += f"\n\nCONTEXTO DE ESTA RESPUESTA\n{contexto_extra}"
 
-    # Filtrar SILENCIO del historial antes de enviarlo a la IA
-    mensajes = [
-        {"role": msg["role"], "content": msg["content"]}
-        for msg in historial
-        if msg["content"].strip() != "SILENCIO"
-    ]
+    # Construir mensajes: system como primer mensaje, luego historial, luego el actual.
+    # Filtrar SILENCIO para no confundir al modelo.
+    mensajes = [{"role": "system", "content": system_prompt}]
+    for msg in historial:
+        if msg["content"].strip() != "SILENCIO":
+            mensajes.append({"role": msg["role"], "content": msg["content"]})
     mensajes.append({"role": "user", "content": mensaje})
 
+    # Seleccionar tier de modelos segun complejidad
+    models_config = get_ai_models()
+    complejo = _es_consulta_compleja(mensaje, historial)
+    models = models_config["full"] if complejo else models_config["quick"]
+
+    tier = "full" if complejo else "quick"
+    logger.debug(f"Tier seleccionado: {tier} — modelos: {models}")
+
     try:
-        if AI_PROVIDER == "claude":
-            return await _responder_claude(system_prompt, mensajes)
-        elif AI_PROVIDER == "openai":
-            return await _responder_openai(system_prompt, mensajes)
-        elif AI_PROVIDER == "gemini":
-            return await _responder_gemini(system_prompt, mensajes)
-        else:
-            logger.error(f"AI_PROVIDER no soportado: {AI_PROVIDER}")
-            return obtener_mensaje_error()
+        kwargs: dict = {
+            "model": models[0],
+            "max_tokens": _MAX_TOKENS,
+            "messages": mensajes,
+        }
+        # Multi-model fallback: si hay mas de un modelo en el tier, usar routing de OpenRouter
+        if len(models) > 1:
+            kwargs["extra_body"] = {"models": models, "route": "fallback"}
+
+        response = await client.chat.completions.create(**kwargs)
+
+        respuesta = response.choices[0].message.content or ""
+        usage = response.usage
+        modelo_usado = getattr(response, "model", models[0])
+        logger.info(
+            f"Respuesta generada ({usage.prompt_tokens} in / {usage.completion_tokens} out) "
+            f"modelo={modelo_usado} tier={tier}"
+        )
+        return respuesta
+
     except Exception as e:
-        logger.error(f"Error {AI_PROVIDER} API: {e}")
-        return obtener_mensaje_error()
+        logger.error(f"Error OpenRouter API: {e}")
+        return get_error_message()
