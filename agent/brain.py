@@ -1,5 +1,5 @@
 # agent/brain.py — Cerebro del agente: conexion con OpenRouter API
-# WhatsApp Agent Base
+# WhatsApp Agent — SimpleProp Sofi
 
 """
 Logica de IA del agente. Lee el system prompt desde WP config (o YAML local)
@@ -9,11 +9,15 @@ modelo completo para consultas complejas.
 """
 
 import os
+import json
 import logging
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agent.config_loader import get_ai_models, get_system_prompt, get_fallback_message, get_error_message
+from agent.config_loader import get_ai_models, get_system_prompt, get_fallback_message, get_error_message, get_active_connectors
 from agent.knowledge_loader import get_knowledge_text, get_public_docs
+from agent.connectors.registry import get_tools_for_connector, build_connectors_context
+from agent.connectors.executor import execute_tool
+from agent.memory import obtener_contacto
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
@@ -26,6 +30,19 @@ client = AsyncOpenAI(
 
 # Maximo de tokens por respuesta.
 _MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
+
+# Prefixes de modelos que soportan function calling en OpenRouter.
+TOOL_USE_PREFIXES = (
+    "anthropic/",
+    "openai/gpt-",
+    "google/gemini-",
+    "deepseek/deepseek-chat",
+    "meta-llama/llama-3.3",
+    "mistralai/mistral-large",
+)
+
+# Fallback si ningun modelo del plan soporta tool use.
+TOOL_USE_FALLBACK_MODEL = "anthropic/claude-3-5-haiku"
 
 # Capa fija de naturalidad — se antepone a TODOS los system prompts.
 _WHATSAPP_NATURALNESS = """\
@@ -52,6 +69,26 @@ LARGO
 """
 
 
+def _filter_tool_use_capable(models: list[str]) -> list[str]:
+    """Retorna solo los modelos que soportan function calling."""
+    return [m for m in models if any(m.startswith(p) for p in TOOL_USE_PREFIXES)]
+
+
+def _build_contact_context(contacto) -> str:
+    """Inyecta los datos del cliente al system prompt si existen."""
+    if contacto is None:
+        return ""
+    nombre = (contacto.nombre or "").strip()
+    email = (contacto.email or "").strip()
+    if not nombre and not email:
+        return ""
+    return (
+        "\n\nDATOS DEL CLIENTE\n"
+        f"Nombre: {nombre or '(sin dato)'}\n"
+        f"Email: {email or '(sin dato)'}"
+    )
+
+
 def _es_consulta_compleja(mensaje: str, historial: list[dict]) -> bool:
     """
     Heuristica para determinar si el mensaje requiere un modelo mas capaz.
@@ -75,21 +112,21 @@ def _es_consulta_compleja(mensaje: str, historial: list[dict]) -> bool:
     return score >= 2
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra: str = "") -> str:
+async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra: str = "", telefono: str = "") -> str:
     """
-    Genera una respuesta usando OpenRouter.
+    Genera respuesta del LLM. Si hay conectores activos, soporta tool use loop.
+    Backward compat: sin conectores, hace una sola llamada al LLM como antes.
 
     Args:
-        mensaje: El mensaje nuevo del usuario.
-        historial: Lista de mensajes anteriores [{"role": "user/assistant", "content": "..."}].
-        contexto_extra: Instrucciones adicionales para esta respuesta.
-
-    Returns:
-        La respuesta generada por el modelo.
+        mensaje: el mensaje nuevo del cliente.
+        historial: lista de [{role, content}] anteriores.
+        contexto_extra: contexto adicional para esta respuesta puntual.
+        telefono: telefono del cliente (para inyectar en tool calls + lookup contacto).
     """
     if not mensaje or len(mensaje.strip()) < 2:
         return get_fallback_message()
 
+    # Construir system prompt: capa naturalidad + system_prompt + knowledge + public_docs + contexto_extra
     system_prompt = _WHATSAPP_NATURALNESS + get_system_prompt()
 
     knowledge = get_knowledge_text()
@@ -112,43 +149,111 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     if contexto_extra:
         system_prompt += f"\n\nCONTEXTO DE ESTA RESPUESTA\n{contexto_extra}"
 
-    # Construir mensajes: system como primer mensaje, luego historial, luego el actual.
-    # Filtrar SILENCIO para no confundir al modelo.
+    # NUEVO: agregar info del contacto si existe
+    if telefono:
+        try:
+            contacto = await obtener_contacto(telefono)
+            system_prompt += _build_contact_context(contacto)
+        except Exception as e:
+            logger.warning(f"No se pudo obtener contacto: {e}")
+
+    # NUEVO: agregar contexto de conectores y armar tools
+    conectores = get_active_connectors()
+    tools: list[dict] = []
+    for c in conectores:
+        tools.extend(get_tools_for_connector(c))
+    if conectores:
+        system_prompt += build_connectors_context(conectores)
+
+    # Construir mensajes para el LLM (filtrar SILENCIO)
     mensajes = [{"role": "system", "content": system_prompt}]
-    for msg in historial:
-        if msg["content"].strip() != "SILENCIO":
-            mensajes.append({"role": msg["role"], "content": msg["content"]})
+    for m in historial:
+        if m.get("content", "").strip() != "SILENCIO":
+            mensajes.append({"role": m["role"], "content": m["content"]})
     mensajes.append({"role": "user", "content": mensaje})
 
-    # Seleccionar tier de modelos segun complejidad
+    # Seleccionar tier y modelos
     models_config = get_ai_models()
     complejo = _es_consulta_compleja(mensaje, historial)
-    models = models_config["full"] if complejo else models_config["quick"]
-
     tier = "full" if complejo else "quick"
+    models = list(models_config.get(tier, []) or [])
+
     logger.debug(f"Tier seleccionado: {tier} — modelos: {models}")
 
-    try:
-        kwargs: dict = {
-            "model": models[0],
-            "max_tokens": _MAX_TOKENS,
-            "messages": mensajes,
-        }
-        # Multi-model fallback: si hay mas de un modelo en el tier, usar routing de OpenRouter
-        if len(models) > 1:
-            kwargs["extra_body"] = {"models": models, "route": "fallback"}
+    # Si hay tools, filtrar modelos compatibles
+    if tools:
+        filtered = _filter_tool_use_capable(models)
+        if not filtered:
+            logger.warning(f"Plan sin modelos compatibles con tool use; fallback a {TOOL_USE_FALLBACK_MODEL}")
+            filtered = [TOOL_USE_FALLBACK_MODEL]
+        models = filtered
 
-        response = await client.chat.completions.create(**kwargs)
+    if not models:
+        logger.error("Sin modelos configurados; usando fallback")
+        models = [TOOL_USE_FALLBACK_MODEL]
 
-        respuesta = response.choices[0].message.content or ""
-        usage = response.usage
-        modelo_usado = getattr(response, "model", models[0])
-        logger.info(
-            f"Respuesta generada ({usage.prompt_tokens} in / {usage.completion_tokens} out) "
-            f"modelo={modelo_usado} tier={tier}"
-        )
-        return respuesta
+    # Tool use loop (max 5 iteraciones)
+    for iteration in range(5):
+        try:
+            kwargs: dict = {
+                "model": models[0],
+                "max_tokens": _MAX_TOKENS,
+                "messages": mensajes,
+            }
+            if tools:
+                kwargs["tools"] = tools
+            if len(models) > 1:
+                kwargs["extra_body"] = {"models": models, "route": "fallback"}
 
-    except Exception as e:
-        logger.error(f"Error OpenRouter API: {e}")
-        return get_error_message()
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            logger.error(f"OpenRouter error iteration {iteration}: {e}")
+            return get_error_message()
+
+        msg = response.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+
+        if not tool_calls:
+            respuesta = msg.content or ""
+            if iteration == 0:
+                # Log original info only on direct (no-tool) responses
+                usage = response.usage
+                modelo_usado = getattr(response, "model", models[0])
+                logger.info(
+                    f"Respuesta generada ({usage.prompt_tokens} in / {usage.completion_tokens} out) "
+                    f"modelo={modelo_usado} tier={tier}"
+                )
+            return respuesta
+
+        # Append the assistant message (con tool_calls) al historial para que el LLM tenga contexto
+        try:
+            mensajes.append(msg.model_dump(exclude_unset=True))
+        except Exception:
+            mensajes.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+        # Ejecutar cada tool call y agregar el resultado
+        for tc in tool_calls:
+            result = await execute_tool(tc, telefono)
+            mensajes.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, default=str),
+            })
+
+    # Si llegamos aca, excedimos max iterations
+    logger.error(f"Tool use loop excedio max iterations para {telefono}")
+    return get_error_message()

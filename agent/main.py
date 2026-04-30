@@ -1,8 +1,8 @@
 # agent/main.py — Servidor FastAPI + Webhook de WhatsApp
-# WhatsApp Agent Base
+# Generado por AgentKit
 
 """
-Servidor principal del agente de WhatsApp.
+Servidor principal del agente de WhatsApp de SimpleProp (Sofi).
 Funciona con cualquier proveedor (Whapi, Meta, Twilio) gracias a la capa de providers.
 """
 
@@ -24,34 +24,11 @@ from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
 from agent import usage_reporter
 
-load_dotenv()
-
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
-logging.basicConfig(level=log_level)
-logger = logging.getLogger("agentkit")
-
-proveedor = obtener_proveedor()
-PORT = int(os.getenv("PORT", 8000))
-
-KEYWORDS_ESCALAR = [
-    "quiero hablar con",
-    "hablar con alguien",
-    "hablar con una persona",
-    "hablar con un humano",
-    "hablar con alguien del equipo",
-    "con un asesor",
-    "con el dueño",
-    "con el encargado",
-    "me comunicas con",
-    "me pasas con",
-    "quiero un humano",
-    "llamame",
-    "llamar a alguien",
-]
-
 def _silencios_consecutivos(historial: list[dict]) -> int:
-    """Cuenta cuántos mensajes consecutivos del asistente son SILENCIO al final del historial."""
+    """
+    Cuenta cuántos mensajes consecutivos del asistente son SILENCIO
+    al final del historial.
+    """
     count = 0
     for msg in reversed(historial):
         if msg["role"] == "assistant":
@@ -71,6 +48,7 @@ def _debe_prebloquear(historial: list[dict]) -> bool:
     n = _silencios_consecutivos(historial)
     if n == 0:
         return False
+    # Cada 3 silencios consecutivos, Claude obtiene una oportunidad
     return n % 3 != 0
 
 
@@ -91,7 +69,9 @@ def _dividir_partes(texto: str) -> list[str]:
     Divide la respuesta de Claude en partes usando '---' como separador.
     Claude usa esta convencion cuando el prompt le indica enviar mensajes cortos
     y dividir respuestas largas en partes.
+    Filtra partes vacias y normaliza espacios.
     """
+    # Soporta: '\n---\n', '\n\n---\n\n', '---' solo en una linea
     import re
     partes = re.split(r'\n\s*---\s*\n', texto)
     return [p.strip() for p in partes if p.strip()]
@@ -101,6 +81,7 @@ def _parsear_enviar_archivo(respuesta: str) -> tuple[str, str | None]:
     """
     Busca la señal ENVIAR_ARCHIVO:<nombre> al final de la respuesta de Claude.
     Retorna (texto_limpio, nombre_archivo_o_None).
+    La señal puede estar en la ultima linea o precedida de un salto.
     """
     lineas = respuesta.rstrip().splitlines()
     for i in range(len(lineas) - 1, max(len(lineas) - 4, -1), -1):
@@ -144,6 +125,7 @@ def _respuesta_version() -> str:
         return "Version: sin informacion de actualizacion disponible."
     try:
         from datetime import datetime, timezone, timedelta
+        # WP guarda en UTC con formato MySQL: '2026-04-17 14:30:00'
         dt_utc = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         tz_local = timezone(timedelta(hours=get_tz_offset()))
         dt_local = dt_utc.astimezone(tz_local)
@@ -158,7 +140,7 @@ def _respuesta_version() -> str:
 
 async def _es_nueva_sesion(telefono: str) -> bool:
     """
-    Retorna True si el último mensaje fue de un día diferente (en hora local)
+    Retorna True si el último mensaje fue de un día diferente (en hora Argentina)
     o si no hay historial previo.
     """
     ultimo = await obtener_ultimo_timestamp(telefono)
@@ -169,6 +151,34 @@ async def _es_nueva_sesion(telefono: str) -> bool:
     ultimo_local = ultimo.replace(tzinfo=timezone.utc).astimezone(tz_local)
     return ahora.date() != ultimo_local.date()
 
+load_dotenv()
+
+# Configuración de logging según entorno
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
+logging.basicConfig(level=log_level)
+logger = logging.getLogger("agentkit")
+
+# Proveedor de WhatsApp (se configura en .env con WHATSAPP_PROVIDER)
+proveedor = obtener_proveedor()
+PORT = int(os.getenv("PORT", 8000))
+
+KEYWORDS_ESCALAR = [
+    "quiero hablar con",
+    "hablar con alguien",
+    "hablar con una persona",
+    "hablar con un humano",
+    "hablar con alguien del equipo",
+    "con un asesor",
+    "con el dueño",
+    "con el encargado",
+    "me comunicas con",
+    "me pasas con",
+    "quiero un humano",
+    "llamame",
+    "llamar a alguien",
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -176,13 +186,13 @@ async def lifespan(app: FastAPI):
     await inicializar_db()
     await usage_reporter.start()
     logger.info("Base de datos inicializada")
-    logger.info(f"Servidor corriendo en puerto {PORT}")
+    logger.info(f"Servidor AgentKit corriendo en puerto {PORT}")
     logger.info(f"Proveedor de WhatsApp: {proveedor.__class__.__name__}")
     yield
 
 
 app = FastAPI(
-    title="WhatsApp AI Agent",
+    title="SimpleProp — Sofi (WhatsApp AI Agent)",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -191,7 +201,7 @@ app = FastAPI(
 @app.get("/")
 async def health_check():
     """Endpoint de salud para Railway/monitoreo."""
-    return {"status": "ok", "service": "whatsapp-agent"}
+    return {"status": "ok", "service": "simpleprop-sofi"}
 
 
 @app.get("/config")
@@ -216,7 +226,7 @@ async def webhook_statuses(request: Request):
 
 @app.get("/webhook")
 async def webhook_verificacion(request: Request):
-    """Verificación GET del webhook (requerido por Meta Cloud API)."""
+    """Verificación GET del webhook (requerido por Meta Cloud API, no-op para otros)."""
     resultado = await proveedor.validar_webhook(request)
     if resultado is not None:
         return PlainTextResponse(str(resultado))
@@ -231,7 +241,9 @@ async def webhook_handler(request: Request):
     Procesa el mensaje, genera respuesta con Claude y la envía de vuelta.
     """
     try:
+        # Parsear webhook — el proveedor normaliza el formato
         mensajes = await proveedor.parsear_webhook(request)
+
         caps = get_capabilities()
         fue_audio = False
 
@@ -285,6 +297,7 @@ async def webhook_handler(request: Request):
                 logger.info(f"Fuera de horario — respuesta enviada a {msg.telefono}")
                 continue
 
+            # Obtener historial ANTES de guardar el mensaje actual
             historial = await obtener_historial(msg.telefono)
 
             # Pre-bloquear si hay silencios consecutivos recientes (sin llamar a Claude)
@@ -326,7 +339,8 @@ async def webhook_handler(request: Request):
                 profundidad = f"Ya llevan {turnos} intercambios. Responde solo lo que se pregunta, sin introduccion."
                 contexto = f"{contexto}\n{profundidad}".strip() if contexto else profundidad
 
-            respuesta = await generar_respuesta(msg.texto, historial, contexto)
+            # Generar respuesta con Claude
+            respuesta = await generar_respuesta(msg.texto, historial, contexto, telefono=msg.telefono)
 
             # Si Claude indica silencio, guardar en DB y no enviar
             if respuesta.strip() == "SILENCIO":
@@ -346,6 +360,7 @@ async def webhook_handler(request: Request):
             archivo_nombre: str | None = None
             respuesta, archivo_nombre = _parsear_enviar_archivo(respuesta)
 
+            # Guardar mensaje del usuario Y respuesta del agente en memoria
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
@@ -355,11 +370,13 @@ async def webhook_handler(request: Request):
             for idx, parte in enumerate(partes):
                 delay = max(1, min(round(len(parte) * 0.025), 5))
                 if idx == 0:
+                    # Primera parte: indicador de presencia segun tipo de mensaje
                     if fue_audio:
                         await proveedor.indicar_grabando(msg.telefono)
                     else:
                         await proveedor.indicar_escribiendo(msg.telefono, delay)
                 else:
+                    # Partes siguientes: siempre "escribiendo" con pausa realista
                     await proveedor.indicar_escribiendo(msg.telefono, delay)
                 await asyncio.sleep(delay)
                 await proveedor.enviar_mensaje(msg.telefono, parte)
