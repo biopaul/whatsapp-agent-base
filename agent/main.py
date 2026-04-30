@@ -11,7 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 
@@ -404,3 +404,53 @@ async def webhook_handler(request: Request):
     except Exception as e:
         logger.error(f"Error en webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agent/notification")
+async def agent_notification(
+    request: Request,
+    x_gowap_token: str = Header(default=""),
+):
+    """
+    Recibe pushes desde WP para enviar mensajes proactivos al cliente final
+    (recordatorios 24h, alertas de cancelacion, etc.). El mensaje se guarda
+    en el historial como assistant para que el LLM tenga contexto en futuros
+    turnos cuando el cliente responda.
+
+    Auth: header X-Gowap-Token debe matchear el token del CONFIG_URL del agente.
+
+    Body JSON: {phone, message, event_id?, kind?}
+    """
+    config_url = os.getenv("CONFIG_URL", "")
+    expected_token = (config_url or "").rsplit("/config/", 1)[-1] if "/config/" in config_url else ""
+    if not expected_token or x_gowap_token != expected_token:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    phone = str(body.get("phone", "") or "").strip()
+    message = str(body.get("message", "") or "").strip()
+    if not phone or not message:
+        raise HTTPException(status_code=400, detail="missing fields")
+
+    # Guardar en historial primero (asi el LLM lo ve en proximos turnos)
+    try:
+        await guardar_mensaje(phone, "assistant", message)
+    except Exception as e:
+        logger.error(f"agent_notification: error guardando en historial: {e}")
+        # No abortar — intentar enviar igual
+
+    # Enviar via provider (WAHA)
+    try:
+        ok = await proveedor.enviar_mensaje(phone, message)
+    except Exception as e:
+        logger.error(f"agent_notification: provider exception: {e}")
+        raise HTTPException(status_code=502, detail="provider exception")
+
+    if not ok:
+        raise HTTPException(status_code=502, detail="provider failed")
+
+    return {"status": "sent"}
