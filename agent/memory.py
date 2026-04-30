@@ -41,6 +41,21 @@ class Mensaje(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Contacto(Base):
+    """
+    Datos del cliente final aprendidos durante la conversación.
+    Indexado por número de teléfono. Persiste entre sesiones.
+    """
+    __tablename__ = "contactos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telefono: Mapped[str] = mapped_column(String(50), index=True, unique=True)
+    nombre: Mapped[str] = mapped_column(String(120), default="")
+    email: Mapped[str] = mapped_column(String(190), default="")
+    primer_contacto: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    actualizado_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 async def inicializar_db():
     """Crea las tablas si no existen."""
     async with engine.begin() as conn:
@@ -112,4 +127,41 @@ async def limpiar_historial(telefono: str):
         mensajes = result.scalars().all()
         for msg in mensajes:
             await session.delete(msg)
+        await session.commit()
+
+
+async def obtener_contacto(telefono: str) -> Contacto | None:
+    """Retorna el Contacto por teléfono o None si no existe."""
+    async with async_session() as session:
+        query = select(Contacto).where(Contacto.telefono == telefono)
+        result = await session.execute(query)
+        return result.scalar_one_or_none()
+
+
+async def guardar_contacto(telefono: str, nombre: str = "", email: str = "") -> None:
+    """
+    Crea o actualiza el contacto. Solo actualiza los campos no vacíos
+    (no pisa nombre con "" si ya hay nombre guardado, idem email).
+    """
+    async with async_session() as session:
+        query = select(Contacto).where(Contacto.telefono == telefono)
+        result = await session.execute(query)
+        contacto = result.scalar_one_or_none()
+
+        ahora = datetime.utcnow()
+        if contacto is None:
+            contacto = Contacto(
+                telefono=telefono,
+                nombre=nombre,
+                email=email,
+                primer_contacto=ahora,
+                actualizado_en=ahora,
+            )
+            session.add(contacto)
+        else:
+            if nombre:
+                contacto.nombre = nombre
+            if email:
+                contacto.email = email
+            contacto.actualizado_en = ahora
         await session.commit()

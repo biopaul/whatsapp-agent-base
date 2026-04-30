@@ -27,6 +27,7 @@ _agent_paused: bool = False
 _pause_reason: str | None = None
 
 # Modelos por defecto para cada tier (OpenRouter model IDs).
+# Se usan cuando el plan no tiene modelos configurados.
 _DEFAULT_MODELS_QUICK = [
     "anthropic/claude-3-5-haiku",
     "openai/gpt-4o-mini",
@@ -230,13 +231,15 @@ def get_tz_offset() -> int:
 
 def get_ai_models() -> dict:
     """
-    Retorna listas de modelos OpenRouter para cada tier: quick y full.
+    Retorna listas de modelos OpenRouter para cada tier: quick (rapido/barato) y full (capaz).
     Prioridad: config remoto > defaults hardcoded.
+    Si el config remoto no tiene modelos configurados, intenta backward compat con ai_model.
     """
     cfg = get_config()
     quick = cfg.get("models_quick") or []
     full = cfg.get("models_full") or []
 
+    # Backward compat: si el config solo tiene ai_model (string viejo), usarlo en ambos tiers
     if not quick and not full:
         legacy = (cfg.get("ai_model") or os.getenv("AI_MODEL", "")).strip()
         if legacy:
@@ -329,3 +332,19 @@ def invalidate_cache() -> None:
     global _cache, _cache_ts
     _cache = None
     _cache_ts = 0.0
+
+
+def get_active_connectors() -> list[dict]:
+    """
+    Retorna la lista de conectores activos para este agente.
+
+    Cada item es un dict con: slug, enabled, configured, config_summary.
+    Si no hay conectores en la config remota (caso de agentes sin connector framework),
+    retorna lista vacía. Esto preserva backward compat: los agentes sin conectores
+    pasan tools=None al LLM y se comportan idéntico a antes.
+    """
+    cfg = get_config()
+    connectors = cfg.get("connectors", [])
+    if not isinstance(connectors, list):
+        return []
+    return connectors
