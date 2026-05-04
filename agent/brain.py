@@ -69,6 +69,11 @@ LARGO
 """
 
 
+def _is_anthropic_model(model: str) -> bool:
+    """True si el modelo se rutea a Anthropic — soporta cache_control: ephemeral explicito."""
+    return model.startswith("anthropic/")
+
+
 def _filter_tool_use_capable(models: list[str]) -> list[str]:
     """Retorna solo los modelos que soportan function calling."""
     return [m for m in models if any(m.startswith(p) for p in TOOL_USE_PREFIXES)]
@@ -126,17 +131,21 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     if not mensaje or len(mensaje.strip()) < 2:
         return get_fallback_message()
 
-    # Construir system prompt: capa naturalidad + system_prompt + knowledge + public_docs + contexto_extra
-    system_prompt = _WHATSAPP_NATURALNESS + get_system_prompt()
+    # === STATIC PORTION (cacheable) ===
+    # Esta parte es identica entre llamadas para el mismo agente.
+    # Cuando un modelo Anthropic la procesa, marcamos cache_control: ephemeral
+    # para que su API la cachee y subsiguientes llamadas paguen ~10% del costo.
+    # Para OpenAI/DeepSeek/Gemini2.5, el caching es automatico sobre prefijos identicos.
+    static_parts: list[str] = [_WHATSAPP_NATURALNESS, get_system_prompt()]
 
     knowledge = get_knowledge_text()
     if knowledge:
-        system_prompt += f"\n\nDOCUMENTOS DE REFERENCIA\n\n{knowledge}"
+        static_parts.append(f"\n\nDOCUMENTOS DE REFERENCIA\n\n{knowledge}")
 
     public_docs = get_public_docs()
     if public_docs:
         nombres = "\n".join(f"- {d['name']}" for d in public_docs)
-        system_prompt += (
+        static_parts.append(
             "\n\nARCHIVOS QUE PODES ENVIAR AL CLIENTE\n"
             "Cuando consideres que el cliente se beneficiaria de recibir uno de estos archivos "
             "(por ejemplo: catalogo, lista de precios, ficha tecnica), podes enviarselo.\n"
@@ -146,33 +155,39 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
             f"Archivos disponibles:\n{nombres}"
         )
 
-    if contexto_extra:
-        system_prompt += f"\n\nCONTEXTO DE ESTA RESPUESTA\n{contexto_extra}"
-
-    # NUEVO: agregar info del contacto si existe
-    if telefono:
-        try:
-            contacto = await obtener_contacto(telefono)
-            system_prompt += _build_contact_context(contacto)
-        except Exception as e:
-            logger.warning(f"No se pudo obtener contacto: {e}")
-
-    # NUEVO: agregar contexto de conectores y armar tools
+    # Conector context tambien estatico — solo cambia cuando el cliente actualiza su config
     conectores = get_active_connectors()
     tools: list[dict] = []
     for c in conectores:
         tools.extend(get_tools_for_connector(c))
     if conectores:
-        system_prompt += build_connectors_context(conectores)
+        static_parts.append(build_connectors_context(conectores))
 
-    # Construir mensajes para el LLM (filtrar SILENCIO)
-    mensajes = [{"role": "system", "content": system_prompt}]
-    for m in historial:
-        if m.get("content", "").strip() != "SILENCIO":
-            mensajes.append({"role": m["role"], "content": m["content"]})
-    mensajes.append({"role": "user", "content": mensaje})
+    static_system = "".join(static_parts)
 
-    # Seleccionar tier y modelos
+    # === DYNAMIC PORTION (NOT cacheable) ===
+    # Esta parte cambia por mensaje (contexto del dia, saludo) o por conversacion (contacto).
+    # La metemos despues del cache breakpoint para que no rompa cache hits.
+    dynamic_parts: list[str] = []
+
+    if contexto_extra:
+        dynamic_parts.append(f"\n\nCONTEXTO DE ESTA RESPUESTA\n{contexto_extra}")
+
+    if telefono:
+        try:
+            contacto = await obtener_contacto(telefono)
+            contact_ctx = _build_contact_context(contacto)
+            if contact_ctx:
+                dynamic_parts.append(contact_ctx)
+        except Exception as e:
+            logger.warning(f"No se pudo obtener contacto: {e}")
+
+    dynamic_system = "".join(dynamic_parts)
+
+    # === Build messages list ===
+    # Para Anthropic: structured content blocks con cache_control en la parte estatica
+    # Para otros: string concatenado (auto-cache de OpenAI/DeepSeek igual cubre el prefijo)
+    # Seleccionar tier y modelos primero para saber si aplica cache_control
     models_config = get_ai_models()
     complejo = _es_consulta_compleja(mensaje, historial)
     tier = "full" if complejo else "quick"
@@ -191,6 +206,31 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     if not models:
         logger.error("Sin modelos configurados; usando fallback")
         models = [TOOL_USE_FALLBACK_MODEL]
+
+    use_cache_control = any(_is_anthropic_model(m) for m in models)
+
+    if use_cache_control:
+        system_content_blocks: list[dict] = [
+            {
+                "type": "text",
+                "text": static_system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        if dynamic_system:
+            system_content_blocks.append({
+                "type": "text",
+                "text": dynamic_system,
+            })
+        system_message: dict = {"role": "system", "content": system_content_blocks}
+    else:
+        system_message = {"role": "system", "content": static_system + dynamic_system}
+
+    mensajes = [system_message]
+    for m in historial:
+        if m.get("content", "").strip() != "SILENCIO":
+            mensajes.append({"role": m["role"], "content": m["content"]})
+    mensajes.append({"role": "user", "content": mensaje})
 
     # Tool use loop (max 5 iteraciones)
     for iteration in range(5):
@@ -216,11 +256,24 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
         if not tool_calls:
             respuesta = msg.content or ""
             if iteration == 0:
-                # Log original info only on direct (no-tool) responses
+                # Log con cache info
                 usage = response.usage
+                prompt_tokens = getattr(usage, "prompt_tokens", 0)
+                completion_tokens = getattr(usage, "completion_tokens", 0)
+
+                # cached_tokens viene en prompt_tokens_details (extension OpenAI/OpenRouter)
+                cached_tokens = 0
+                details = getattr(usage, "prompt_tokens_details", None)
+                if details is not None:
+                    if isinstance(details, dict):
+                        cached_tokens = int(details.get("cached_tokens", 0) or 0)
+                    else:
+                        cached_tokens = int(getattr(details, "cached_tokens", 0) or 0)
+
                 modelo_usado = getattr(response, "model", models[0])
+                cache_info = f" cached={cached_tokens}" if cached_tokens > 0 else ""
                 logger.info(
-                    f"Respuesta generada ({usage.prompt_tokens} in / {usage.completion_tokens} out) "
+                    f"Respuesta generada ({prompt_tokens} in / {completion_tokens} out{cache_info}) "
                     f"modelo={modelo_usado} tier={tier}"
                 )
             return respuesta
