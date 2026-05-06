@@ -21,6 +21,8 @@ from typing import Optional
 
 import httpx
 
+from agent import __version__
+
 logger = logging.getLogger("agentkit")
 
 USAGE_URL: str = os.getenv("USAGE_URL", "")
@@ -118,7 +120,7 @@ async def _send_with_retry(events: list[dict]) -> None:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     USAGE_URL,
-                    json={"events": events},
+                    json={"version": __version__, "events": events},
                     headers={"Content-Type": "application/json"},
                 )
 
@@ -169,3 +171,14 @@ async def _send_with_retry(events: list[dict]) -> None:
             backoff = min(backoff * 2, 60.0)
 
     logger.error(f"Usage: {len(events)} eventos perdidos tras {_MAX_RETRIES} reintentos")
+
+
+async def report_version_only() -> None:
+    """
+    Single-shot heartbeat al startup. Manda version + events vacios para
+    que el plugin sepa que el container arranco con esta version aunque
+    el cliente no haya escrito todavia.
+    """
+    if not USAGE_URL or _bad_token:
+        return
+    await _send_with_retry([])
