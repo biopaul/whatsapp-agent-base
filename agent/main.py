@@ -185,6 +185,12 @@ async def lifespan(app: FastAPI):
     """Inicializa la base de datos al arrancar el servidor."""
     await inicializar_db()
     await usage_reporter.start()
+    # Single-shot heartbeat para reportar version apenas arranca el container
+    try:
+        await usage_reporter.report_version_only()
+        logger.info("Version reportada al plugin via /usage")
+    except Exception as e:
+        logger.warning(f"No se pudo reportar version al startup: {e}")
     logger.info("Base de datos inicializada")
     logger.info(f"Servidor AgentKit corriendo en puerto {PORT}")
     logger.info(f"Proveedor de WhatsApp: {proveedor.__class__.__name__}")
