@@ -34,6 +34,19 @@ class ProveedorWhatsApp(ABC):
         """Envía un mensaje de texto. Retorna True si fue exitoso."""
         ...
 
+    async def enviar_mensaje_returning_id(self, telefono: str, mensaje: str) -> str | None:
+        """
+        Envia un mensaje y retorna el ID del mensaje creado por el proveedor.
+        Usado para dedupear webhooks from_me=true cuando capturamos mensajes
+        enviados durante un takeover.
+
+        Default: llama enviar_mensaje y retorna None (sin id). Providers que
+        soportan retornar el id deberian sobreescribir este metodo.
+        Sentinel "ok_no_id" significa: envio exitoso pero sin id disponible.
+        """
+        ok = await self.enviar_mensaje(telefono, mensaje)
+        return "ok_no_id" if ok else None
+
     async def validar_webhook(self, request: Request) -> dict | int | None:
         """Verificación GET del webhook (solo Meta la requiere). Retorna respuesta o None."""
         return None

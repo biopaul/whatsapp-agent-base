@@ -16,13 +16,14 @@ from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 
 from agent.brain import generar_respuesta
-from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp
+from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp, existe_mensaje_id
+from agent import brain
 from agent.providers import obtener_proveedor
 from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
-from agent import usage_reporter
+from agent import usage_reporter, takeover
 
 def _silencios_consecutivos(historial: list[dict]) -> int:
     """
@@ -163,6 +164,67 @@ logger = logging.getLogger("agentkit")
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
 
+async def send_user_message(chat_id: str, text: str) -> bool:
+    """
+    Envia un mensaje al cliente con checkpoint de takeover (race protection).
+
+    Si entre la generacion del LLM y este envio el chat paso a manual mode,
+    descartamos el mensaje. Caso happy: enviamos via provider y persistimos
+    en historial con mensaje_id (para que el webhook from_me posterior dedupee).
+
+    Returns: True si se envio, False si se descarto o fallo el envio.
+    """
+    if await takeover.is_chat_in_manual_mode(chat_id):
+        logger.info(f"discard_response reason=manual_mode_during_generation chat_id={chat_id}")
+        return False
+
+    msg_id = await proveedor.enviar_mensaje_returning_id(chat_id, text)
+    if msg_id is None:
+        return False
+
+    persisted_id = msg_id if msg_id != "ok_no_id" else None
+    await guardar_mensaje(chat_id, "assistant", text, mensaje_id=persisted_id)
+    return True
+
+
+async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str | None = None) -> None:
+    """
+    Procesa un mensaje del cliente (from_me=False).
+    Checkpoint 1: si el chat esta en manual mode, guardamos en historial pero NO
+    llamamos al LLM ni enviamos respuesta.
+    """
+    if await takeover.is_chat_in_manual_mode(chat_id):
+        logger.info(f"skip_response reason=manual_mode chat_id={chat_id}")
+        await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
+        return
+
+    # Flujo normal: guardar entrante + invocar LLM + enviar via wrapper
+    await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
+    historial = await obtener_historial(chat_id)
+    respuesta = await brain.generar_respuesta(texto, historial, telefono=chat_id)
+    await send_user_message(chat_id, respuesta)
+
+
+async def _procesar_mensaje_propio(chat_id: str, texto: str, mensaje_id: str | None = None) -> None:
+    """
+    Procesa un mensaje from_me=True. En modo normal lo ignoramos (es nuestro propio
+    mensaje, ya guardado por send_user_message). Pero si el chat esta o estuvo
+    recientemente en manual, el mensaje puede ser de un humano - lo guardamos como
+    assistant para que el LLM lo vea cuando vuelva a tomar control.
+    """
+    en_manual = await takeover.is_chat_in_manual_mode(chat_id)
+    recently = takeover.was_recently_manual(chat_id) if not en_manual else None
+
+    if not en_manual and recently is None:
+        return  # mensaje normal del agente, ya guardado por send_user_message
+
+    if mensaje_id and await existe_mensaje_id(chat_id, mensaje_id):
+        return  # ya guardado por send_user_message - dedupe
+
+    await guardar_mensaje(chat_id, "assistant", texto, mensaje_id=mensaje_id)
+    logger.info(f"captured_human_message chat_id={chat_id} mensaje_id={mensaje_id}")
+
+
 KEYWORDS_ESCALAR = [
     "quiero hablar con",
     "hablar con alguien",
@@ -191,6 +253,11 @@ async def lifespan(app: FastAPI):
         logger.info("Version reportada al plugin via /usage")
     except Exception as e:
         logger.warning(f"No se pudo reportar version al startup: {e}")
+    # Cargar chats actualmente en manual mode (handoff humano-IA)
+    try:
+        await takeover.preload_active()
+    except Exception as e:
+        logger.warning(f"No se pudo preload takeover state: {e}")
     logger.info("Base de datos inicializada")
     logger.info(f"Servidor AgentKit corriendo en puerto {PORT}")
     logger.info(f"Proveedor de WhatsApp: {proveedor.__class__.__name__}")
@@ -255,6 +322,24 @@ async def webhook_handler(request: Request):
 
         for msg in mensajes:
             if msg.es_propio:
+                if msg.texto:
+                    await _procesar_mensaje_propio(
+                        msg.telefono,
+                        msg.texto,
+                        mensaje_id=getattr(msg, "mensaje_id", None),
+                    )
+                continue
+
+            # Checkpoint manual mode: persistir entrante + skip LLM/respuesta
+            if await takeover.is_chat_in_manual_mode(msg.telefono):
+                logger.info(f"skip_response reason=manual_mode chat_id={msg.telefono}")
+                if msg.texto:
+                    await guardar_mensaje(
+                        msg.telefono,
+                        "user",
+                        msg.texto,
+                        mensaje_id=getattr(msg, "mensaje_id", None),
+                    )
                 continue
 
             # Soft pause — ignorar mensajes si el plan esta pausado
@@ -293,13 +378,13 @@ async def webhook_handler(request: Request):
 
             # Comando /version — responde sin llamar a Claude ni contar como mensaje
             if msg.texto.strip().lower() == "/version":
-                await proveedor.enviar_mensaje(msg.telefono, _respuesta_version())
+                await send_user_message(msg.telefono, _respuesta_version())
                 continue
 
             # Gate de horario — responder fuera de horario sin llamar a la IA
             if not is_within_business_hours():
                 out_msg = get_out_of_hours_message()
-                await proveedor.enviar_mensaje(msg.telefono, out_msg)
+                await send_user_message(msg.telefono, out_msg)
                 logger.info(f"Fuera de horario — respuesta enviada a {msg.telefono}")
                 continue
 
@@ -317,11 +402,10 @@ async def webhook_handler(request: Request):
             if _detectar_keyword_escalar(msg.texto):
                 respuesta = "Claro! Te conecto con alguien del equipo ahora mismo."
                 await guardar_mensaje(msg.telefono, "user", msg.texto)
-                await guardar_mensaje(msg.telefono, "assistant", respuesta)
                 delay = max(1, min(round(len(respuesta) * 0.025), 5))
                 await proveedor.indicar_escribiendo(msg.telefono, delay)
                 await asyncio.sleep(delay)
-                await proveedor.enviar_mensaje(msg.telefono, respuesta)
+                await send_user_message(msg.telefono, respuesta)
                 await _enviar_alerta_humano(msg.telefono, "El cliente pide hablar con un humano")
                 logger.info(f"Escalado por keyword: {msg.telefono}")
                 continue
@@ -366,9 +450,8 @@ async def webhook_handler(request: Request):
             archivo_nombre: str | None = None
             respuesta, archivo_nombre = _parsear_enviar_archivo(respuesta)
 
-            # Guardar mensaje del usuario Y respuesta del agente en memoria
+            # Guardar mensaje del usuario; el assistant se persiste por parte via send_user_message
             await guardar_mensaje(msg.telefono, "user", msg.texto)
-            await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
             # Dividir en partes si Claude uso separador ---
             partes = _dividir_partes(respuesta)
@@ -385,7 +468,7 @@ async def webhook_handler(request: Request):
                     # Partes siguientes: siempre "escribiendo" con pausa realista
                     await proveedor.indicar_escribiendo(msg.telefono, delay)
                 await asyncio.sleep(delay)
-                await proveedor.enviar_mensaje(msg.telefono, parte)
+                await send_user_message(msg.telefono, parte)
 
             logger.info(f"Respuesta a {msg.telefono} ({len(partes)} parte/s): {respuesta[:120]}")
 
@@ -442,16 +525,9 @@ async def agent_notification(
     if not phone or not message:
         raise HTTPException(status_code=400, detail="missing fields")
 
-    # Guardar en historial primero (asi el LLM lo ve en proximos turnos)
+    # send_user_message envia via provider y persiste en historial (con checkpoint takeover)
     try:
-        await guardar_mensaje(phone, "assistant", message)
-    except Exception as e:
-        logger.error(f"agent_notification: error guardando en historial: {e}")
-        # No abortar — intentar enviar igual
-
-    # Enviar via provider (WAHA)
-    try:
-        ok = await proveedor.enviar_mensaje(phone, message)
+        ok = await send_user_message(phone, message)
     except Exception as e:
         logger.error(f"agent_notification: provider exception: {e}")
         raise HTTPException(status_code=502, detail="provider exception")

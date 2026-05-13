@@ -108,6 +108,47 @@ class ProveedorWAHA(ProveedorWhatsApp):
                 logger.error(f"Error WAHA enviar: {e}")
                 return False
 
+    async def enviar_mensaje_returning_id(self, telefono: str, mensaje: str) -> str | None:
+        """Envia mensaje via WAHA y retorna el message id (si WAHA lo provee)."""
+        if not self.base_url:
+            logger.warning("WAHA_BASE_URL no configurado — mensaje no enviado")
+            return None
+        chat_id = _asegurar_chat_id(telefono)
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/sendText",
+                    json={
+                        "session": self.session,
+                        "chatId": chat_id,
+                        "text": mensaje,
+                    },
+                    headers=self._headers(),
+                )
+                if r.status_code not in (200, 201):
+                    logger.error(f"Error WAHA enviar: {r.status_code} — {r.text}")
+                    return None
+                # Parsear id del response. WAHA puede retornar:
+                #   {"id": "false_chat@c.us_3EB..."}
+                # o anidarlo en {"_data": {...}, "id": {...}}
+                try:
+                    body = r.json()
+                except Exception:
+                    return "ok_no_id"
+                if isinstance(body, dict):
+                    raw_id = body.get("id")
+                    if isinstance(raw_id, str) and raw_id:
+                        return raw_id
+                    if isinstance(raw_id, dict):
+                        # Algunos WAHA retornan {"id": {"_serialized": "..."}}
+                        serialized = raw_id.get("_serialized") or raw_id.get("id")
+                        if isinstance(serialized, str) and serialized:
+                            return serialized
+                return "ok_no_id"
+            except Exception as e:
+                logger.error(f"Error WAHA enviar: {e}")
+                return None
+
     async def _set_presence(self, telefono: str, presence: str) -> None:
         """Envia un estado de presencia al chat."""
         chat_id = _asegurar_chat_id(telefono)
