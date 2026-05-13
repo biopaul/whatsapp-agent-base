@@ -18,6 +18,7 @@ from agent.knowledge_loader import get_knowledge_text, get_public_docs
 from agent.connectors.registry import get_tools_for_connector, build_connectors_context
 from agent.connectors.executor import execute_tool
 from agent.memory import obtener_contacto
+from agent import takeover
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
@@ -137,6 +138,22 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     # para que su API la cachee y subsiguientes llamadas paguen ~10% del costo.
     # Para OpenAI/DeepSeek/Gemini2.5, el caching es automatico sobre prefijos identicos.
     static_parts: list[str] = [_WHATSAPP_NATURALNESS, get_system_prompt()]
+
+    # Awareness de handoff humano-IA: si el chat estuvo (o esta) en manual mode
+    # recientemente, avisar al LLM que los assistant messages en ese rango pueden
+    # ser de un humano, no del LLM mismo.
+    if telefono:
+        _window = takeover.was_recently_manual(telefono)
+        if _window:
+            _start, _end = _window
+            static_parts.append(
+                "\n\n## Nota de contexto operativa\n"
+                f"Entre {_start.isoformat()} y {_end.isoformat()} este chat fue "
+                "atendido manualmente por un operador humano. Los mensajes con "
+                "role=assistant en ese rango fueron escritos por un humano, no por "
+                "vos. No contradigas lo que dijo y continua la conversacion "
+                "coherentemente."
+            )
 
     knowledge = get_knowledge_text()
     if knowledge:

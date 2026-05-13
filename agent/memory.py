@@ -39,6 +39,7 @@ class Mensaje(Base):
     role: Mapped[str] = mapped_column(String(20))  # "user" o "assistant"
     content: Mapped[str] = mapped_column(Text)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    mensaje_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
 
 
 class Contacto(Base):
@@ -57,19 +58,28 @@ class Contacto(Base):
 
 
 async def inicializar_db():
-    """Crea las tablas si no existen."""
+    """Crea las tablas si no existen + migracion no-destructiva."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migracion: agregar mensaje_id si la tabla ya existia sin esa columna.
+        try:
+            await conn.exec_driver_sql(
+                "ALTER TABLE mensajes ADD COLUMN mensaje_id VARCHAR(100) NULL"
+            )
+        except Exception:
+            # Columna ya existe - ignorar (SQLite no soporta IF NOT EXISTS en ADD COLUMN)
+            pass
 
 
-async def guardar_mensaje(telefono: str, role: str, content: str):
+async def guardar_mensaje(telefono: str, role: str, content: str, mensaje_id: str | None = None):
     """Guarda un mensaje en el historial de conversación."""
     async with async_session() as session:
         mensaje = Mensaje(
             telefono=telefono,
             role=role,
             content=content,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.utcnow(),
+            mensaje_id=mensaje_id,
         )
         session.add(mensaje)
         await session.commit()
@@ -165,3 +175,21 @@ async def guardar_contacto(telefono: str, nombre: str = "", email: str = "") -> 
                 contacto.email = email
             contacto.actualizado_en = ahora
         await session.commit()
+
+
+async def existe_mensaje_id(telefono: str, mensaje_id: str | None) -> bool:
+    """
+    Verifica si ya guardamos este mensaje_id para este telefono.
+    Usado para dedupear webhooks from_me=true cuando capturamos mensajes
+    enviados por humanos durante un takeover.
+    """
+    if not mensaje_id:
+        return False
+    async with async_session() as session:
+        query = (
+            select(Mensaje.id)
+            .where(Mensaje.telefono == telefono, Mensaje.mensaje_id == mensaje_id)
+            .limit(1)
+        )
+        result = await session.execute(query)
+        return result.scalar() is not None
