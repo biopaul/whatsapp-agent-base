@@ -1,12 +1,18 @@
 # agent/takeover.py — Cliente del endpoint /takeover del plugin WP + cache local
 
 """
-Maneja el flag mode=manual del plugin WP: cuando un humano toma una conversacion
-desde Seguimiento, el agente Python deja de responder hasta que el TTL vence.
+Maneja dos flags ortogonales del plugin WP, ambos servidos por GET /takeover/{chat_id}:
+
+1) mode=manual: cuando un humano toma una conversacion desde Seguimiento, el agente
+   Python deja de responder hasta que el TTL vence.
+
+2) is_customer: cuando un humano marca el contacto como cliente convertido. El
+   agente sigue respondiendo pero cambia su filosofia (soporte vs venta).
 
 Cache in-memory con TTL diferenciado:
 - Positivos (manual): trust until expires_at, no se re-pollea.
 - Negativos (auto):   trust por POLL_INTERVAL_AUTO segundos, despues re-poll.
+- Customer cache se actualiza en el mismo poll que el takeover cache.
 
 Modo no-op: si TAKEOVER_URL_BASE no esta seteado, el modulo retorna False siempre
 (util para dev local sin plugin desplegado).
@@ -37,7 +43,19 @@ class TakeoverEntry:
     last_manual_until: Optional[datetime] = None
 
 
+@dataclass
+class CustomerEntry:
+    """Estado de cliente convertido. Poblado desde la misma llamada GET /takeover/{chat_id}."""
+    is_customer: bool
+    customer_since: Optional[datetime] = None
+    # Marcamos cuando observamos transicion False -> True. None significa: estado inicial,
+    # no hubo conversion observada (puede ser un cliente preexistente cargado por preload).
+    customer_converted_at: Optional[datetime] = None
+    last_polled: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 _cache: dict[str, TakeoverEntry] = {}
+_customer_cache: dict[str, CustomerEntry] = {}
 _token_invalid: bool = False  # set True tras un 401; se limpia en restart
 
 
@@ -90,6 +108,32 @@ async def is_chat_in_manual_mode(chat_id: str) -> bool:
     if new_entry.mode == "manual" and new_entry.expires_at and new_entry.expires_at > now:
         return True
     return False
+
+
+def is_chat_customer(chat_id: str) -> tuple[bool, Optional[datetime]]:
+    """
+    Lectura sync del estado de cliente. Retorna (is_customer, customer_since).
+    Si el chat no esta en la cache, asume (False, None) — fail-open consistente.
+    Se asume que el caller ya invoco is_chat_in_manual_mode() previamente para
+    refrescar la cache (ambas caches se actualizan en el mismo poll).
+    """
+    entry = _customer_cache.get(chat_id)
+    if entry is None:
+        return (False, None)
+    return (entry.is_customer, entry.customer_since)
+
+
+def was_recently_converted(chat_id: str) -> bool:
+    """
+    True si observamos una transicion False -> True para este chat dentro de los
+    ultimos AWARENESS_LOOKBACK_MIN minutos. Sirve para inyectar la linea extra al
+    system prompt cuando el cliente se convirtio mid-stream.
+    """
+    entry = _customer_cache.get(chat_id)
+    if entry is None or entry.customer_converted_at is None:
+        return False
+    cutoff = _now() - timedelta(minutes=AWARENESS_LOOKBACK_MIN)
+    return entry.customer_converted_at > cutoff
 
 
 def was_recently_manual(chat_id: str) -> Optional[tuple[datetime, datetime]]:
@@ -159,24 +203,36 @@ async def preload_active() -> None:
         return
 
     now = _now()
-    loaded = 0
+    loaded_manual = 0
+    loaded_customer = 0
     for item in items:
         if not isinstance(item, dict):
             continue
         chat_id = item.get("chat_id")
-        raw_exp = item.get("expires_at")
-        if not isinstance(chat_id, str) or not isinstance(raw_exp, str):
+        if not isinstance(chat_id, str):
             continue
-        expires_at = _parse_iso(raw_exp)
-        if expires_at is None or expires_at <= now:
-            continue
-        _cache[chat_id] = TakeoverEntry(
-            mode="manual",
-            expires_at=expires_at,
-            last_polled=now,
-        )
-        loaded += 1
-    logger.info(f"Takeover preload: {loaded} chats en manual mode cargados")
+
+        # Manual takeover: solo carga si mode=manual y expires_at vigente.
+        if item.get("mode") == "manual":
+            raw_exp = item.get("expires_at")
+            expires_at = _parse_iso(raw_exp) if isinstance(raw_exp, str) else None
+            if expires_at is not None and expires_at > now:
+                _cache[chat_id] = TakeoverEntry(
+                    mode="manual",
+                    expires_at=expires_at,
+                    last_polled=now,
+                )
+                loaded_manual += 1
+
+        # Customer flag: ortogonal al manual, mismo entry puede traer ambos.
+        if item.get("is_customer"):
+            _update_customer_cache_from_response(chat_id, item)
+            loaded_customer += 1
+
+    logger.info(
+        f"Takeover preload: {loaded_manual} chats en manual mode, "
+        f"{loaded_customer} chats marcados como cliente cargados"
+    )
 
 
 async def _poll_chat(chat_id: str) -> Optional[TakeoverEntry]:
@@ -229,7 +285,44 @@ async def _poll_chat(chat_id: str) -> Optional[TakeoverEntry]:
             logger.warning(f"Takeover poll {chat_id}: manual sin expires_at valido - tratando como auto")
             mode = "auto"
 
+    # Update customer cache (mismo poll, response extendida con is_customer/customer_since)
+    _update_customer_cache_from_response(chat_id, body)
+
     return TakeoverEntry(mode=mode, expires_at=expires_at, last_polled=_now())
+
+
+def _update_customer_cache_from_response(chat_id: str, body: dict) -> None:
+    """
+    Actualiza _customer_cache a partir del body del endpoint /takeover/{chat_id} o
+    de un item de /active. Detecta transicion False -> True para marcar
+    customer_converted_at y permitir el aviso "recien convertido" al LLM.
+    """
+    is_customer = bool(body.get("is_customer", False))
+    customer_since = None
+    raw_since = body.get("customer_since")
+    if isinstance(raw_since, str) and raw_since:
+        customer_since = _parse_iso(raw_since)
+
+    now = _now()
+    prev = _customer_cache.get(chat_id)
+
+    converted_at: Optional[datetime] = None
+    if prev is not None:
+        if not prev.is_customer and is_customer:
+            # Transicion observada en esta sesion del agente.
+            converted_at = now
+        elif prev.is_customer and is_customer:
+            # Preservar el marcador previo si existia.
+            converted_at = prev.customer_converted_at
+        # Si is_customer paso a False, converted_at queda en None.
+    # Si no habia entry previa, no marcamos converted_at (puede ser cliente preexistente).
+
+    _customer_cache[chat_id] = CustomerEntry(
+        is_customer=is_customer,
+        customer_since=customer_since,
+        customer_converted_at=converted_at,
+        last_polled=now,
+    )
 
 
 def _parse_iso(s: str) -> Optional[datetime]:
