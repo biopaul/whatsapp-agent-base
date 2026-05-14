@@ -199,6 +199,34 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
         except Exception as e:
             logger.warning(f"No se pudo obtener contacto: {e}")
 
+        # Awareness de cliente convertido: si el plugin marco al contacto como cliente,
+        # cambia la filosofia del agente (soporte vs vendedor). Va en dynamic porque el
+        # estado puede cambiar mid-stream (el operador humano lo marca desde la UI).
+        is_cust, cust_since = takeover.is_chat_customer(telefono)
+        if is_cust:
+            since_str = cust_since.date().isoformat() if cust_since else "(fecha no disponible)"
+            customer_block = (
+                "\n\n## Cliente activo\n"
+                f"IMPORTANTE: este contacto ya es CLIENTE de nuestro negocio "
+                f"(cliente desde {since_str}). Cambia tu enfoque por completo:\n\n"
+                "- NO sos un vendedor: sos un asistente de soporte y customer success.\n"
+                "- NO le ofrezcas el producto/servicio principal: ya lo tiene.\n"
+                "- Asumi que conoce el negocio. Evita explicaciones basicas de que hacemos.\n"
+                "- Trato cordial y familiar, como con alguien que ya nos conoce.\n"
+                "- Si pregunta algo nuevo, ayuda a resolverlo. Si parece duda comercial "
+                "sobre un servicio adicional, sondea suavemente pero SIN tactica de venta.\n"
+                "- Si detecta una queja o reclamo serio, escalalo al humano (no intentes "
+                "resolverlo solo).\n"
+                "- Mantene tono profesional pero mas distendido: el cliente ya invirtio en "
+                "nosotros, no hace falta convencerlo de nada."
+            )
+            if takeover.was_recently_converted(telefono):
+                customer_block += (
+                    "\n\nNota: este contacto fue marcado como cliente recientemente. "
+                    "Ajusta tu tono y deja de intentar venderle lo que ya compro."
+                )
+            dynamic_parts.append(customer_block)
+
     dynamic_system = "".join(dynamic_parts)
 
     # === Build messages list ===
