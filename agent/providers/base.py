@@ -70,3 +70,41 @@ class ProveedorWhatsApp(ABC):
     async def enviar_archivo(self, telefono: str, url: str, filename: str, caption: str = "") -> bool:
         """Envia un archivo (PDF, DOCX, etc.) al cliente. Retorna True si fue exitoso."""
         return False
+
+    async def enviar_buttons(
+        self,
+        telefono: str,
+        body_text: str,
+        buttons: list[dict],
+        footer: str | None = None,
+    ) -> tuple[bool, int | None, str | None]:
+        """
+        Envia un mensaje con botones reply. Cap de 3 botones (limite WAHA reply).
+
+        buttons: [{"id": "opt_1", "title": "Confirmar"}, ...]
+
+        Retorna (ok, status_code, mensaje_id):
+        - ok=True: envio exitoso, status 200/201, mensaje_id puede ser str o None.
+        - ok=False, status_code=501: provider/engine no soporta (caer a list).
+        - ok=False, status_code=otro o None: error real (caer a texto).
+
+        Default: NotImplementedError para forzar override en providers que lo soportan.
+        """
+        raise NotImplementedError("Provider no implementa enviar_buttons")
+
+    async def enviar_list(
+        self,
+        telefono: str,
+        body_text: str,
+        button_title: str,
+        sections: list[dict],
+        footer: str | None = None,
+    ) -> tuple[bool, int | None, str | None]:
+        """
+        Envia un List Message. WAHA soporta hasta 10 rows totales en sections.
+
+        sections: [{"title": "Servicios", "rows": [{"id": "opt_1", "title": "...", "description": "..."}, ...]}]
+
+        Retorna (ok, status_code, mensaje_id).
+        """
+        raise NotImplementedError("Provider no implementa enviar_list")

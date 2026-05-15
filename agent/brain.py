@@ -19,6 +19,7 @@ from agent.connectors.registry import get_tools_for_connector, build_connectors_
 from agent.connectors.executor import execute_tool
 from agent.memory import obtener_contacto
 from agent import takeover
+from agent import guided_templates, guided_dispatcher
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
@@ -138,6 +139,15 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     # para que su API la cachee y subsiguientes llamadas paguen ~10% del costo.
     # Para OpenAI/DeepSeek/Gemini2.5, el caching es automatico sobre prefijos identicos.
     static_parts: list[str] = [_WHATSAPP_NATURALNESS, get_system_prompt()]
+
+    # Plantillas guiadas activas (RESPUESTAS GUIADAS)
+    try:
+        _plantillas = await guided_templates.get_active()
+        _bloque = guided_dispatcher.render_plantillas_prompt_block(_plantillas)
+        if _bloque:
+            static_parts.append(_bloque)
+    except Exception as e:
+        logger.warning(f"No se pudo cargar plantillas guiadas: {e}")
 
     # Awareness de handoff humano-IA: si el chat estuvo (o esta) en manual mode
     # recientemente, avisar al LLM que los assistant messages en ese rango pueden

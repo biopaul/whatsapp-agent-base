@@ -17,6 +17,24 @@ def _asegurar_chat_id(telefono: str) -> str:
     return f"{telefono}@c.us"
 
 
+def _extract_msg_id(response) -> str | None:
+    """Extrae el id del mensaje del response WAHA (soporta {'id': str} o {'id': {'_serialized': str}})."""
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("id")
+    if isinstance(raw, str) and raw:
+        return raw
+    if isinstance(raw, dict):
+        s = raw.get("_serialized") or raw.get("id")
+        if isinstance(s, str) and s:
+            return s
+    return None
+
+
 class ProveedorWAHA(ProveedorWhatsApp):
     """Proveedor de WhatsApp usando WAHA (self-hosted)."""
 
@@ -231,3 +249,80 @@ class ProveedorWAHA(ProveedorWhatsApp):
                     logger.info(f"reaccionar WAHA: {r.status_code} — {r.text}")
             except Exception as e:
                 logger.info(f"reaccionar WAHA fallo (no critico): {e}")
+
+    async def enviar_buttons(
+        self,
+        telefono: str,
+        body_text: str,
+        buttons: list[dict],
+        footer: str | None = None,
+    ) -> tuple[bool, int | None, str | None]:
+        """WAHA /api/sendButtons. Retorna (ok, status, msg_id)."""
+        if not self.base_url:
+            return (False, None, None)
+        chat_id = _asegurar_chat_id(telefono)
+        payload: dict = {
+            "session": self.session,
+            "chatId": chat_id,
+            "body": body_text,
+            "buttons": [{"type": "reply", "id": b["id"], "title": b["title"]} for b in buttons[:3]],
+        }
+        if footer:
+            payload["footer"] = footer
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/sendButtons",
+                    json=payload,
+                    headers=self._headers(),
+                )
+            except Exception as e:
+                logger.error(f"WAHA sendButtons exception: {e}")
+                return (False, None, None)
+
+            if r.status_code in (200, 201):
+                msg_id = _extract_msg_id(r)
+                return (True, r.status_code, msg_id)
+            if r.status_code == 501:
+                logger.info(f"WAHA sendButtons: 501 Not Implemented (engine no soporta)")
+                return (False, 501, None)
+            logger.error(f"WAHA sendButtons HTTP {r.status_code}: {r.text[:200]}")
+            return (False, r.status_code, None)
+
+    async def enviar_list(
+        self,
+        telefono: str,
+        body_text: str,
+        button_title: str,
+        sections: list[dict],
+        footer: str | None = None,
+    ) -> tuple[bool, int | None, str | None]:
+        """WAHA /api/sendList. Retorna (ok, status, msg_id)."""
+        if not self.base_url:
+            return (False, None, None)
+        chat_id = _asegurar_chat_id(telefono)
+        payload: dict = {
+            "session": self.session,
+            "chatId": chat_id,
+            "body": body_text,
+            "buttonText": button_title,
+            "sections": sections,
+        }
+        if footer:
+            payload["footer"] = footer
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/sendList",
+                    json=payload,
+                    headers=self._headers(),
+                )
+            except Exception as e:
+                logger.error(f"WAHA sendList exception: {e}")
+                return (False, None, None)
+
+            if r.status_code in (200, 201):
+                msg_id = _extract_msg_id(r)
+                return (True, r.status_code, msg_id)
+            logger.error(f"WAHA sendList HTTP {r.status_code}: {r.text[:200]}")
+            return (False, r.status_code, None)
