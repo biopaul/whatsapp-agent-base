@@ -24,6 +24,8 @@ from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
 from agent import usage_reporter, takeover
+from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
+from agent.memory import obtener_dispatch_activo
 
 def _silencios_consecutivos(historial: list[dict]) -> int:
     """
@@ -163,6 +165,7 @@ logger = logging.getLogger("agentkit")
 # Proveedor de WhatsApp (se configura en .env con WHATSAPP_PROVIDER)
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
+WAHA_SESSION = os.getenv("WAHA_SESSION", "default")
 
 async def send_user_message(chat_id: str, text: str) -> bool:
     """
@@ -190,19 +193,70 @@ async def send_user_message(chat_id: str, text: str) -> bool:
 async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str | None = None) -> None:
     """
     Procesa un mensaje del cliente (from_me=False).
-    Checkpoint 1: si el chat esta en manual mode, guardamos en historial pero NO
-    llamamos al LLM ni enviamos respuesta.
+    Orden:
+    1. Checkpoint takeover: si manual mode, persistir user + skip.
+    2. Selection check: si hay dispatch activo + input matchea opcion -> ejecutar accion.
+    3. Flujo normal: guardar + LLM + dispatcher si respondio con <plantilla>.
     """
     if await takeover.is_chat_in_manual_mode(chat_id):
         logger.info(f"skip_response reason=manual_mode chat_id={chat_id}")
         await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
         return
 
-    # Flujo normal: guardar entrante + invocar LLM + enviar via wrapper
     await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
+
+    # Selection-first: hay dispatch activo? matchea el input?
+    from agent import memory as _mem
+    dispatch = await _mem.obtener_dispatch_activo(chat_id)
+    if dispatch is not None:
+        match = guided_selection.match_user_input(texto, dispatch)
+        if match is not None:
+            from datetime import datetime as _dt, timezone as _tz
+            opt = match["option"]
+            logger.info(
+                f"guided_selection chat={chat_id} dispatch={dispatch['id']} "
+                f"option_id={opt.get('id')} match_kind={match['match_kind']}"
+            )
+            remote_id = dispatch.get("remote_dispatch_id")
+            if remote_id is not None:
+                await guided_templates.register_selection(remote_id, int(opt["id"]), _dt.now(_tz.utc))
+
+            result = await guided_actions.ejecutar_accion(
+                option=opt, chat_id=chat_id, session_id=WAHA_SESSION,
+                provider=proveedor, parent_dispatch_local_id=dispatch["id"],
+            )
+
+            if result["kind"] == "text_injection":
+                injected = result["injected_text"]
+                historial = await _mem.obtener_historial(chat_id)
+                respuesta = await brain.generar_respuesta(injected, historial, telefono=chat_id)
+                await _procesar_respuesta_llm(chat_id, respuesta)
+            return
+
+    # Flujo normal
     historial = await obtener_historial(chat_id)
     respuesta = await brain.generar_respuesta(texto, historial, telefono=chat_id)
-    await send_user_message(chat_id, respuesta)
+    await _procesar_respuesta_llm(chat_id, respuesta)
+
+
+async def _procesar_respuesta_llm(chat_id: str, respuesta: str) -> None:
+    """
+    Toma la salida del LLM y decide:
+    - Si contiene <plantilla>X</plantilla> -> guided_dispatcher.dispatch_plantilla
+    - Si no -> send_user_message con splits normales
+    """
+    plantilla_name = guided_dispatcher.parse_plantilla_invocation(respuesta)
+    if plantilla_name:
+        result = await guided_dispatcher.dispatch_plantilla(
+            provider=proveedor, session_id=WAHA_SESSION,
+            chat_id=chat_id, name=plantilla_name,
+        )
+        if result.get("ok"):
+            return
+        logger.warning(f"dispatch_plantilla fail: {result.get('reason')} - sending raw LLM text")
+
+    for parte in _dividir_partes(respuesta):
+        await send_user_message(chat_id, parte)
 
 
 async def _procesar_mensaje_propio(chat_id: str, texto: str, mensaje_id: str | None = None) -> None:
