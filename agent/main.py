@@ -24,6 +24,7 @@ from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
 from agent import usage_reporter, takeover
+from agent import contacts_webhook
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
 
@@ -187,6 +188,11 @@ async def send_user_message(chat_id: str, text: str) -> bool:
 
     persisted_id = msg_id if msg_id != "ok_no_id" else None
     await guardar_mensaje(chat_id, "assistant", text, mensaje_id=persisted_id)
+
+    # Fire-and-forget: notificar a WP para mantener contacts sincronizado
+    asyncio.create_task(contacts_webhook.touch_contact(
+        chat_id=chat_id, direction="out", preview=text
+    ))
     return True
 
 
@@ -201,9 +207,31 @@ async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str |
     if await takeover.is_chat_in_manual_mode(chat_id):
         logger.info(f"skip_response reason=manual_mode chat_id={chat_id}")
         await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
+        # Fire-and-forget: notificar a WP del touch entrante (dispara stop-on-reply si aplica)
+        from agent.memory import obtener_contacto as _obt_contacto
+        try:
+            _contacto = await _obt_contacto(chat_id)
+            _name = _contacto.nombre if _contacto and _contacto.nombre else None
+        except Exception as _e:
+            _name = None
+            logger.debug(f"touch_contact: no se pudo obtener contacto - {_e}")
+        asyncio.create_task(contacts_webhook.touch_contact(
+            chat_id=chat_id, direction="in", name=_name, preview=texto
+        ))
         return
 
     await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
+    # Fire-and-forget: notificar a WP del touch entrante (dispara stop-on-reply si aplica)
+    from agent.memory import obtener_contacto as _obt_contacto
+    try:
+        _contacto = await _obt_contacto(chat_id)
+        _name = _contacto.nombre if _contacto and _contacto.nombre else None
+    except Exception as _e:
+        _name = None
+        logger.debug(f"touch_contact: no se pudo obtener contacto - {_e}")
+    asyncio.create_task(contacts_webhook.touch_contact(
+        chat_id=chat_id, direction="in", name=_name, preview=texto
+    ))
 
     # Selection-first: hay dispatch activo? matchea el input?
     from agent import memory as _mem
