@@ -17,8 +17,16 @@ class MensajeEntrante:
     telefono: str       # Numero del remitente
     texto: str          # Contenido del mensaje (o transcripcion si es audio)
     mensaje_id: str     # ID unico del mensaje
-    es_propio: bool     # True si lo envio el agente (se ignora)
+    es_propio: bool     # True si lo envio el agente o un humano externo (fromMe)
     audio_url: str = "" # URL de descarga del audio (si es voice/ptt)
+    # Source del envio para mensajes fromMe (solo WAHA por ahora):
+    #   "app" -> WhatsApp Web / app nativa (humano externo)
+    #   "api" -> WAHA API (eco de envio del agente o Seguimiento)
+    #   ""    -> WAHA antiguo sin campo source; usar heuristica outbound tracker
+    source: str = ""
+    # True si el mensaje fromMe trae media (imagen/video) sin texto; en ese caso
+    # tambien activa takeover externo aunque texto este vacio.
+    tiene_media: bool = False
 
 
 class ProveedorWhatsApp(ABC):

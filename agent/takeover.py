@@ -33,6 +33,29 @@ TAKEOVER_URL_BASE = os.getenv("TAKEOVER_URL_BASE", "")
 POLL_INTERVAL_AUTO = int(os.getenv("TAKEOVER_POLL_AUTO_TTL", "30"))  # segundos
 AWARENESS_LOOKBACK_MIN = int(os.getenv("TAKEOVER_AWARENESS_LOOKBACK", "60"))  # minutos
 HTTP_TIMEOUT = float(os.getenv("TAKEOVER_HTTP_TIMEOUT", "5"))  # segundos
+# Default TTL (en minutos) usado solo si el POST /manual responde sin expires_at
+# parseable. El plugin WP define el TTL real (actualmente 40min).
+MANUAL_FALLBACK_TTL_MIN = int(os.getenv("TAKEOVER_MANUAL_TTL_MIN", "40"))
+
+
+def _resolve_takeover_base() -> str:
+    """
+    Resuelve la URL base de /takeover/{token}. Prioridad:
+      1. TAKEOVER_URL_BASE explicito (env existente).
+      2. Derivacion desde CONFIG_URL (...wp-json/gowap/v1/config/{token}
+         -> ...wp-json/gowap/v1/takeover/{token}).
+    Retorna string vacio si ninguno disponible.
+    """
+    if TAKEOVER_URL_BASE:
+        return TAKEOVER_URL_BASE.rstrip("/")
+    config_url = os.getenv("CONFIG_URL", "").strip()
+    if "/config/" not in config_url:
+        return ""
+    prefix, token = config_url.rsplit("/config/", 1)
+    token = token.rstrip("/")
+    if not token:
+        return ""
+    return f"{prefix}/takeover/{token}"
 
 
 @dataclass
@@ -60,7 +83,7 @@ _token_invalid: bool = False  # set True tras un 401; se limpia en restart
 
 
 def _is_enabled() -> bool:
-    return bool(TAKEOVER_URL_BASE) and not _token_invalid
+    return bool(_resolve_takeover_base()) and not _token_invalid
 
 
 def _now() -> datetime:
@@ -172,10 +195,10 @@ async def preload_active() -> None:
     """
     global _token_invalid
     if not _is_enabled():
-        logger.info("Takeover: TAKEOVER_URL_BASE vacio - modo no-op, skipping preload")
+        logger.info("Takeover: URL base vacia - modo no-op, skipping preload")
         return
 
-    url = f"{TAKEOVER_URL_BASE}/active"
+    url = f"{_resolve_takeover_base()}/active"
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             r = await client.get(url)
@@ -241,7 +264,12 @@ async def _poll_chat(chat_id: str) -> Optional[TakeoverEntry]:
     None significa: error de red/HTTP recuperable, el caller decide fail-open vs cache stale.
     """
     global _token_invalid
-    url = f"{TAKEOVER_URL_BASE}/{chat_id}"
+    base = _resolve_takeover_base()
+    if not base:
+        return None
+    # URL-encode chat_id para path-safe (chat ids contienen @).
+    from urllib.parse import quote
+    url = f"{base}/{quote(chat_id, safe='')}"
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             r = await client.get(url)
@@ -336,3 +364,98 @@ def _parse_iso(s: str) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# External takeover registration (POST /takeover/{token}/manual)
+#
+# Se invoca cuando el parser WAHA detecta un mensaje fromMe con source=app
+# (humano escribiendo desde WhatsApp Web/app nativa fuera del agente).
+# WordPress actualiza el takeover a manual con TTL del lado plugin.
+# ---------------------------------------------------------------------------
+
+
+async def register_manual_takeover(chat_id: str) -> bool:
+    """
+    Activa takeover manual en WP via POST /takeover/{token}/manual.
+    En exito, refresca el cache local a manual=True con el expires_at del response
+    (o un default fallback) para que la proxima lectura sea inmediata sin re-poll.
+    Fail-open: si la red/HTTP falla, retorna False y loggea warning; no crashea.
+    """
+    global _token_invalid
+    if not _is_enabled():
+        return False
+
+    base = _resolve_takeover_base()
+    if not base:
+        return False
+
+    url = f"{base}/manual"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            r = await client.post(url, json={"chat_id": chat_id})
+    except Exception as e:
+        logger.warning(f"Takeover register_manual {chat_id}: red error {type(e).__name__} - {e}")
+        return False
+
+    if r.status_code == 401:
+        logger.error("Takeover register_manual: token invalido (401). Modulo deshabilitado.")
+        _token_invalid = True
+        return False
+
+    if r.status_code != 200:
+        logger.warning(f"Takeover register_manual {chat_id}: HTTP {r.status_code} - {r.text[:200]}")
+        return False
+
+    # Parsear expires_at del response, con fallback al TTL configurado.
+    expires_at = None
+    try:
+        body = r.json()
+        raw_exp = body.get("expires_at")
+        if isinstance(raw_exp, str) and raw_exp:
+            expires_at = _parse_iso(raw_exp)
+    except Exception:
+        pass
+
+    if expires_at is None:
+        expires_at = _now() + timedelta(minutes=MANUAL_FALLBACK_TTL_MIN)
+
+    _cache[chat_id] = TakeoverEntry(
+        mode="manual",
+        expires_at=expires_at,
+        last_polled=_now(),
+    )
+    logger.info(f"Takeover manual registrado por envio externo: {chat_id} hasta {expires_at.isoformat()}")
+    return True
+
+
+def should_register_external_takeover(msg) -> bool:
+    """
+    Heuristica para mensajes salientes (fromMe=True):
+      - source == "app"  -> True  (WhatsApp Web / app nativa, humano)
+      - source == "api"  -> False (eco WAHA: agente o Seguimiento; WP ya marca manual
+                                   desde Seguimiento, el agente no necesita duplicar)
+      - source vacio     -> True solo si NO hay envio reciente del agente en ventana
+                            y hay contenido (texto o media). Conservador.
+
+    Importa outbound lazy para evitar ciclos.
+    """
+    from agent import outbound
+
+    if not getattr(msg, "es_propio", False):
+        return False
+
+    source = (getattr(msg, "source", "") or "").lower()
+    if source == "app":
+        return True
+    if source == "api":
+        return False
+
+    # Source vacio (WAHA antiguo / engines sin source): usar tracker outbound.
+    if outbound.is_recent_agent_outbound(getattr(msg, "telefono", "")):
+        return False
+    return bool(getattr(msg, "texto", "") or getattr(msg, "tiene_media", False))
+
+
+# Alias para alinear nombre con la spec del brief sin romper call-sites existentes.
+is_manual_takeover = is_chat_in_manual_mode

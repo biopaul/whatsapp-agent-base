@@ -59,18 +59,34 @@ class ProveedorWAHA(ProveedorWhatsApp):
 
         payload = body.get("payload", {})
         es_propio = payload.get("fromMe", False)
-        telefono = payload.get("from", "")
         mensaje_id = payload.get("id", "")
+        source = (payload.get("source") or "").lower()  # "app" | "api" | ""
+
+        # Resolver chat_id: para mensajes salientes (fromMe) el remitente "from" es
+        # el numero del agente, no el del cliente. WAHA expone chatId con el destino;
+        # si no esta, usar "to". Para entrantes, "from" es el chat correcto.
+        # Normalizar @s.whatsapp.net -> @c.us (algunos engines WAHA usan el primero).
+        raw_chat = (
+            payload.get("chatId")
+            or (payload.get("to") if es_propio else None)
+            or payload.get("from", "")
+        )
+        chat_id = (raw_chat or "").replace("@s.whatsapp.net", "@c.us")
 
         # Audio / nota de voz — detectar por hasMedia + mimetype
-        has_media = payload.get("hasMedia", False)
+        has_media = bool(payload.get("hasMedia", False))
         media = payload.get("media") or {}
         mimetype = media.get("mimetype", "")
 
         if has_media:
-            logger.info(f"WAHA hasMedia=true de {telefono} | mimetype={mimetype!r} | media_keys={list(media.keys())} | id={mensaje_id}")
+            logger.info(f"WAHA hasMedia=true de {chat_id} | mimetype={mimetype!r} | media_keys={list(media.keys())} | id={mensaje_id} | fromMe={es_propio} | source={source!r}")
 
-        if has_media and mimetype.startswith("audio/"):
+        # Eco WAHA via API: el agente o Seguimiento ya enviaron este mensaje. Skip
+        # antes de cualquier procesamiento adicional (no genera audio, no marca leido).
+        if es_propio and source == "api":
+            return []
+
+        if has_media and mimetype.startswith("audio/") and not es_propio:
             media_url = media.get("url", "")
             if not media_url:
                 media_url = f"{self.base_url}/api/{self.session}/messages/{mensaje_id}/download"
@@ -78,27 +94,48 @@ class ProveedorWAHA(ProveedorWhatsApp):
                 # WAHA reporta URLs con localhost — reescribir a la URL publica.
                 import re
                 media_url = re.sub(r'^https?://localhost(:\d+)?', self.base_url, media_url)
-            logger.info(f"Audio detectado de {telefono}: {mimetype} -> {media_url[:120]}")
+            logger.info(f"Audio detectado de {chat_id}: {mimetype} -> {media_url[:120]}")
             return [MensajeEntrante(
-                telefono=telefono,
+                telefono=chat_id,
                 texto="",
                 mensaje_id=mensaje_id,
                 es_propio=es_propio,
                 audio_url=media_url,
+                source=source,
+                tiene_media=True,
             )]
 
-        # Mensajes de texto
-        texto = payload.get("body", "")
+        # Mensajes de texto / media no-audio
+        texto = payload.get("body", "") or ""
+
+        # Mensajes fromMe: retornarlos si vienen de WhatsApp Web/app (source=app)
+        # o si tienen contenido (texto o media). Sirven para activar takeover externo
+        # y para capturar el historial del humano cuando esta en manual mode.
+        if es_propio:
+            if source == "app" or texto or has_media:
+                return [MensajeEntrante(
+                    telefono=chat_id,
+                    texto=texto,
+                    mensaje_id=mensaje_id,
+                    es_propio=True,
+                    source=source,
+                    tiene_media=has_media,
+                )]
+            return []
+
+        # Entrantes sin texto: solo log, no procesar.
         if not texto and has_media:
-            logger.info(f"WAHA media no-audio ignorado de {telefono}: mimetype={mimetype!r}")
+            logger.info(f"WAHA media no-audio ignorado de {chat_id}: mimetype={mimetype!r}")
         if not texto:
             return []
 
         return [MensajeEntrante(
-            telefono=telefono,
+            telefono=chat_id,
             texto=texto,
             mensaje_id=mensaje_id,
-            es_propio=es_propio,
+            es_propio=False,
+            source=source,
+            tiene_media=has_media,
         )]
 
     async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
