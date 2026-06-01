@@ -23,7 +23,7 @@ from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
-from agent import usage_reporter, takeover
+from agent import usage_reporter, takeover, outbound, debouncer
 from agent import contacts_webhook
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
@@ -185,6 +185,11 @@ async def send_user_message(chat_id: str, text: str) -> bool:
     msg_id = await proveedor.enviar_mensaje_returning_id(chat_id, text)
     if msg_id is None:
         return False
+
+    # Registrar envio del agente para el outbound tracker. Asi cuando llegue el
+    # eco fromMe de WAHA (con source vacio en engines antiguos), no se confunde
+    # con un humano escribiendo desde WhatsApp Web.
+    outbound.register_agent_outbound(chat_id)
 
     persisted_id = msg_id if msg_id != "ok_no_id" else None
     await guardar_mensaje(chat_id, "assistant", text, mensaje_id=persisted_id)
@@ -388,6 +393,133 @@ async def webhook_verificacion(request: Request):
     return {"status": "ok"}
 
 
+async def _procesar_y_responder(
+    chat_id: str,
+    texto: str,
+    mensaje_id: str | None,
+    fue_audio: bool,
+    message_count: int = 1,
+) -> None:
+    """
+    Bloque IA: prebloqueo, escalado, generacion Claude, envio multi-parte,
+    usage reporting, archivos. Lo llama el debouncer cuando la ventana de
+    espera expira, con el texto combinado de uno o varios mensajes seguidos.
+
+    Pre-condiciones (validadas por el caller en el webhook):
+      - chat_id NO esta en manual mode
+      - El agente NO esta pausado
+      - Estamos DENTRO del horario de atencion
+      - El texto no es vacio
+      - No es el comando /version
+    """
+    caps = get_capabilities()
+    historial = await obtener_historial(chat_id)
+
+    # Pre-bloquear si hay silencios consecutivos recientes (sin llamar a Claude)
+    if _debe_prebloquear(historial):
+        await guardar_mensaje(chat_id, "user", texto)
+        await guardar_mensaje(chat_id, "assistant", "SILENCIO")
+        logger.info(f"Pre-bloqueado {chat_id} ({_silencios_consecutivos(historial)} silencios consecutivos)")
+        return
+
+    # Escalado por keyword -- el cliente pide explicitamente un humano
+    if _detectar_keyword_escalar(texto):
+        respuesta_kw = "Claro! Te conecto con alguien del equipo ahora mismo."
+        await guardar_mensaje(chat_id, "user", texto)
+        delay = max(1, min(round(len(respuesta_kw) * 0.025), 5))
+        await proveedor.indicar_escribiendo(chat_id, delay)
+        await asyncio.sleep(delay)
+        await send_user_message(chat_id, respuesta_kw)
+        await _enviar_alerta_humano(chat_id, "El cliente pide hablar con un humano")
+        logger.info(f"Escalado por keyword: {chat_id}")
+        return
+
+    # Detectar si es nueva sesion (nuevo dia) — solo informar la hora, no prescribir formato
+    contexto = ""
+    if await _es_nueva_sesion(chat_id):
+        saludo = _saludo_por_hora()
+        contexto = f"Es la primera vez que este cliente escribe hoy. Es hora de {saludo.lower()}."
+
+    # Indicar profundidad de conversacion para calibrar largo de respuesta
+    turnos = len([m for m in historial if m["role"] == "user"])
+    if turnos >= 3:
+        profundidad = f"Ya llevan {turnos} intercambios. Responde solo lo que se pregunta, sin introduccion."
+        contexto = f"{contexto}\n{profundidad}".strip() if contexto else profundidad
+
+    # Si vinieron varios mensajes seguidos, decirle a la IA para que responda una sola vez.
+    if message_count > 1:
+        nota_multi = (
+            f"El cliente envio {message_count} mensajes seguidos sin esperar respuesta. "
+            "Responde UNA sola vez cubriendo lo que pregunto o dijo en todos ellos. "
+            "No repitas lo que escribio; no respondas mensaje por mensaje."
+        )
+        contexto = f"{contexto}\n{nota_multi}".strip() if contexto else nota_multi
+
+    # Generar respuesta con Claude
+    respuesta = await generar_respuesta(texto, historial, contexto, telefono=chat_id)
+
+    # Si Claude indica silencio, guardar en DB y no enviar
+    if respuesta.strip() == "SILENCIO":
+        await guardar_mensaje(chat_id, "user", texto)
+        await guardar_mensaje(chat_id, "assistant", "SILENCIO")
+        logger.info(f"Silencio activado para {chat_id}")
+        return
+
+    # Detectar senal de escalado: ESCALAR: <motivo>\n<mensaje al cliente>
+    motivo_escalar = None
+    if respuesta.startswith("ESCALAR:"):
+        primera_linea, _, resto = respuesta.partition("\n")
+        motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
+        respuesta = resto.strip()
+
+    # Detectar señal de envio de archivo: ENVIAR_ARCHIVO:<nombre>
+    archivo_nombre: str | None = None
+    respuesta, archivo_nombre = _parsear_enviar_archivo(respuesta)
+
+    # Guardar mensaje del usuario; el assistant se persiste por parte via send_user_message
+    await guardar_mensaje(chat_id, "user", texto)
+
+    # Dividir en partes si Claude uso separador ---
+    partes = _dividir_partes(respuesta)
+
+    for idx, parte in enumerate(partes):
+        delay = max(1, min(round(len(parte) * 0.025), 5))
+        if idx == 0:
+            # Primera parte: indicador de presencia segun tipo de mensaje
+            if fue_audio:
+                await proveedor.indicar_grabando(chat_id)
+            else:
+                await proveedor.indicar_escribiendo(chat_id, delay)
+        else:
+            # Partes siguientes: siempre "escribiendo" con pausa realista
+            await proveedor.indicar_escribiendo(chat_id, delay)
+        await asyncio.sleep(delay)
+        await send_user_message(chat_id, parte)
+
+    logger.info(
+        f"Respuesta a {chat_id} ({len(partes)} parte/s, {message_count} msg combinados): "
+        f"{respuesta[:120]}"
+    )
+
+    # Reportar uso al plugin WP (no-bloqueante)
+    await usage_reporter.report(chat_id)
+
+    # Enviar archivo publico si Claude lo solicito
+    if archivo_nombre:
+        public_docs = get_public_docs()
+        doc = next((d for d in public_docs if d["name"] == archivo_nombre), None)
+        if doc and doc.get("url"):
+            ok_file = await proveedor.enviar_archivo(chat_id, doc["url"], archivo_nombre)
+            if ok_file:
+                outbound.register_agent_outbound(chat_id)
+        else:
+            logger.warning(f"Archivo publico no encontrado: {archivo_nombre!r}")
+
+    if motivo_escalar:
+        await _enviar_alerta_humano(chat_id, motivo_escalar)
+        logger.info(f"Alerta de escalado enviada: {motivo_escalar}")
+
+
 @app.post("/webhook/messages")
 @app.post("/webhook")
 async def webhook_handler(request: Request):
@@ -404,6 +536,16 @@ async def webhook_handler(request: Request):
 
         for msg in mensajes:
             if msg.es_propio:
+                # Detectar humano escribiendo desde WhatsApp Web/app -> activar takeover
+                # manual en WP. Mensajes con source=api (eco del propio agente o
+                # Seguimiento) NO disparan registro: should_register filtra.
+                if takeover.should_register_external_takeover(msg):
+                    try:
+                        await takeover.register_manual_takeover(msg.telefono)
+                    except Exception as e:
+                        logger.warning(f"register_manual_takeover fallo para {msg.telefono}: {e}")
+                # Capturar el mensaje en historial cuando el chat esta/estuvo en manual
+                # (handoff humano-IA), para que el LLM tenga contexto al volver.
                 if msg.texto:
                     await _procesar_mensaje_propio(
                         msg.telefono,
@@ -413,6 +555,7 @@ async def webhook_handler(request: Request):
                 continue
 
             # Checkpoint manual mode: persistir entrante + skip LLM/respuesta
+            # IMPORTANTE: NO marcar leido (tick azul) cuando el agente esta en silencio.
             if await takeover.is_chat_in_manual_mode(msg.telefono):
                 logger.info(f"skip_response reason=manual_mode chat_id={msg.telefono}")
                 if msg.texto:
@@ -429,7 +572,15 @@ async def webhook_handler(request: Request):
                 logger.info(f"Agente pausado ({get_pause_reason()!r}) — ignorando mensaje de {msg.telefono}")
                 continue
 
-            # Marcar como leido inmediatamente (ticks azules)
+            # Gate de horario — silencio total fuera de horario.
+            # NO enviar mensaje automatico, NO marcar leido, NO llamar a la IA.
+            # El cliente vera ticks grises hasta que volvamos a estar en horario y
+            # alguien (IA o humano) atienda.
+            if not is_within_business_hours():
+                logger.info(f"Fuera de horario — silencio total para {msg.telefono}")
+                continue
+
+            # Marcar como leido (ticks azules) — solo si va a procesar el mensaje.
             if caps.get("read_receipts", True):
                 await proveedor.marcar_leido(msg.telefono)
 
@@ -463,112 +614,23 @@ async def webhook_handler(request: Request):
                 await send_user_message(msg.telefono, _respuesta_version())
                 continue
 
-            # Gate de horario — responder fuera de horario sin llamar a la IA
-            if not is_within_business_hours():
-                out_msg = get_out_of_hours_message()
-                await send_user_message(msg.telefono, out_msg)
-                logger.info(f"Fuera de horario — respuesta enviada a {msg.telefono}")
-                continue
-
-            # Obtener historial ANTES de guardar el mensaje actual
-            historial = await obtener_historial(msg.telefono)
-
-            # Pre-bloquear si hay silencios consecutivos recientes (sin llamar a Claude)
-            if _debe_prebloquear(historial):
-                await guardar_mensaje(msg.telefono, "user", msg.texto)
-                await guardar_mensaje(msg.telefono, "assistant", "SILENCIO")
-                logger.info(f"Pre-bloqueado {msg.telefono} ({_silencios_consecutivos(historial)} silencios consecutivos)")
-                continue
-
-            # Escalado por keyword -- el cliente pide explicitamente un humano
-            if _detectar_keyword_escalar(msg.texto):
-                respuesta = "Claro! Te conecto con alguien del equipo ahora mismo."
-                await guardar_mensaje(msg.telefono, "user", msg.texto)
-                delay = max(1, min(round(len(respuesta) * 0.025), 5))
-                await proveedor.indicar_escribiendo(msg.telefono, delay)
-                await asyncio.sleep(delay)
-                await send_user_message(msg.telefono, respuesta)
-                await _enviar_alerta_humano(msg.telefono, "El cliente pide hablar con un humano")
-                logger.info(f"Escalado por keyword: {msg.telefono}")
-                continue
-
-            # Reaccion contextual al mensaje del cliente (antes de responder)
+            # Reaccion contextual al mensaje (feedback inmediato antes del debounce)
             if caps.get("reactions", True):
                 emoji = elegir_reaccion(msg.texto)
                 if emoji:
                     await proveedor.reaccionar(msg.telefono, msg.mensaje_id, emoji)
                     logger.info(f"Reaccion {emoji} a {msg.telefono}")
 
-            # Detectar si es nueva sesion (nuevo dia) — solo informar la hora, no prescribir formato
-            contexto = ""
-            if await _es_nueva_sesion(msg.telefono):
-                saludo = _saludo_por_hora()
-                contexto = f"Es la primera vez que este cliente escribe hoy. Es hora de {saludo.lower()}."
-
-            # Indicar profundidad de conversacion para calibrar largo de respuesta
-            turnos = len([m for m in historial if m["role"] == "user"])
-            if turnos >= 3:
-                profundidad = f"Ya llevan {turnos} intercambios. Responde solo lo que se pregunta, sin introduccion."
-                contexto = f"{contexto}\n{profundidad}".strip() if contexto else profundidad
-
-            # Generar respuesta con Claude
-            respuesta = await generar_respuesta(msg.texto, historial, contexto, telefono=msg.telefono)
-
-            # Si Claude indica silencio, guardar en DB y no enviar
-            if respuesta.strip() == "SILENCIO":
-                await guardar_mensaje(msg.telefono, "user", msg.texto)
-                await guardar_mensaje(msg.telefono, "assistant", "SILENCIO")
-                logger.info(f"Silencio activado para {msg.telefono}")
-                continue
-
-            # Detectar senal de escalado: ESCALAR: <motivo>\n<mensaje al cliente>
-            motivo_escalar = None
-            if respuesta.startswith("ESCALAR:"):
-                primera_linea, _, resto = respuesta.partition("\n")
-                motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
-                respuesta = resto.strip()
-
-            # Detectar señal de envio de archivo: ENVIAR_ARCHIVO:<nombre>
-            archivo_nombre: str | None = None
-            respuesta, archivo_nombre = _parsear_enviar_archivo(respuesta)
-
-            # Guardar mensaje del usuario; el assistant se persiste por parte via send_user_message
-            await guardar_mensaje(msg.telefono, "user", msg.texto)
-
-            # Dividir en partes si Claude uso separador ---
-            partes = _dividir_partes(respuesta)
-
-            for idx, parte in enumerate(partes):
-                delay = max(1, min(round(len(parte) * 0.025), 5))
-                if idx == 0:
-                    # Primera parte: indicador de presencia segun tipo de mensaje
-                    if fue_audio:
-                        await proveedor.indicar_grabando(msg.telefono)
-                    else:
-                        await proveedor.indicar_escribiendo(msg.telefono, delay)
-                else:
-                    # Partes siguientes: siempre "escribiendo" con pausa realista
-                    await proveedor.indicar_escribiendo(msg.telefono, delay)
-                await asyncio.sleep(delay)
-                await send_user_message(msg.telefono, parte)
-
-            logger.info(f"Respuesta a {msg.telefono} ({len(partes)} parte/s): {respuesta[:120]}")
-
-            # Reportar uso al plugin WP (no-bloqueante)
-            await usage_reporter.report(msg.telefono)
-
-            # Enviar archivo publico si Claude lo solicito
-            if archivo_nombre:
-                public_docs = get_public_docs()
-                doc = next((d for d in public_docs if d["name"] == archivo_nombre), None)
-                if doc and doc.get("url"):
-                    await proveedor.enviar_archivo(msg.telefono, doc["url"], archivo_nombre)
-                else:
-                    logger.warning(f"Archivo publico no encontrado: {archivo_nombre!r}")
-
-            if motivo_escalar:
-                await _enviar_alerta_humano(msg.telefono, motivo_escalar)
-                logger.info(f"Alerta de escalado enviada: {motivo_escalar}")
+            # Schedule respuesta con debounce. Si llegan mas mensajes en
+            # MESSAGE_DEBOUNCE_SEC, el handler recibe el texto combinado y
+            # responde UNA sola vez en lugar de N veces.
+            debouncer.schedule(
+                msg.telefono,
+                msg.texto,
+                getattr(msg, "mensaje_id", None),
+                fue_audio,
+                _procesar_y_responder,
+            )
 
         return {"status": "ok"}
 
