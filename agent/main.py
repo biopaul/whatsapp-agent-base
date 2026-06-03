@@ -23,7 +23,7 @@ from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
-from agent import usage_reporter, takeover, outbound, debouncer
+from agent import usage_reporter, takeover, outbound, debouncer, labels
 from agent import contacts_webhook
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
@@ -117,6 +117,29 @@ async def _enviar_alerta_humano(telefono: str, motivo: str) -> None:
         await proveedor.enviar_mensaje(notify_phone, alerta)
     except Exception as e:
         logger.error(f"Error enviando alerta a humano: {e}")
+
+
+async def _activar_escalacion(chat_id: str, motivo: str) -> None:
+    """
+    Cierra el ciclo de escalacion en TRES pasos coordinados:
+      1. Notificar al humano dueno del agente via WhatsApp
+      2. Activar takeover manual (silencia la IA hasta que el humano libere)
+      3. Marcar el chat con etiqueta "Escalado" en el plugin WP
+
+    Cada paso es fail-open: si uno falla, los otros igual se intentan.
+    """
+    try:
+        await _enviar_alerta_humano(chat_id, motivo)
+    except Exception as e:
+        logger.error(f"_activar_escalacion alerta_humano fallo: {e}")
+    try:
+        await takeover.register_manual_takeover(chat_id)
+    except Exception as e:
+        logger.warning(f"_activar_escalacion register_manual_takeover fallo: {e}")
+    try:
+        await labels.apply_label(chat_id, "Escalado")
+    except Exception as e:
+        logger.warning(f"_activar_escalacion apply_label fallo: {e}")
 
 
 def _respuesta_version() -> str:
@@ -313,19 +336,40 @@ async def _procesar_mensaje_propio(chat_id: str, texto: str, mensaje_id: str | N
 
 
 KEYWORDS_ESCALAR = [
+    # Solicitud directa de humano
     "quiero hablar con",
     "hablar con alguien",
     "hablar con una persona",
     "hablar con un humano",
     "hablar con alguien del equipo",
+    "hablar con alguien de verdad",
     "con un asesor",
     "con el dueño",
     "con el encargado",
     "me comunicas con",
     "me pasas con",
     "quiero un humano",
+    "necesito un humano",
     "llamame",
     "llamar a alguien",
+    # Rechazo al bot / pedido de persona real
+    "persona real",
+    "alguien real",
+    "ser humano",
+    "operador humano",
+    "atencion humana",
+    "atención humana",
+    "no quiero un bot",
+    "no quiero hablar con un bot",
+    "no kiero hablar con un bot",
+    "no kiero un bot",
+    "no quiero hablar con una maquina",
+    "no quiero hablar con una máquina",
+    "no me sirve este chat",
+    "esto no me ayuda",
+    "esto no sirve",
+    "no me estas ayudando",
+    "no me estás ayudando",
 ]
 
 
@@ -424,13 +468,13 @@ async def _procesar_y_responder(
 
     # Escalado por keyword -- el cliente pide explicitamente un humano
     if _detectar_keyword_escalar(texto):
-        respuesta_kw = "Claro! Te conecto con alguien del equipo ahora mismo."
+        respuesta_kw = "Te conecto con alguien del equipo, en unos minutos te escriben por aca."
         await guardar_mensaje(chat_id, "user", texto)
         delay = max(1, min(round(len(respuesta_kw) * 0.025), 5))
         await proveedor.indicar_escribiendo(chat_id, delay)
         await asyncio.sleep(delay)
         await send_user_message(chat_id, respuesta_kw)
-        await _enviar_alerta_humano(chat_id, "El cliente pide hablar con un humano")
+        await _activar_escalacion(chat_id, "El cliente pide hablar con un humano")
         logger.info(f"Escalado por keyword: {chat_id}")
         return
 
@@ -516,8 +560,8 @@ async def _procesar_y_responder(
             logger.warning(f"Archivo publico no encontrado: {archivo_nombre!r}")
 
     if motivo_escalar:
-        await _enviar_alerta_humano(chat_id, motivo_escalar)
-        logger.info(f"Alerta de escalado enviada: {motivo_escalar}")
+        await _activar_escalacion(chat_id, motivo_escalar)
+        logger.info(f"Escalacion completada (alerta + takeover + label): {motivo_escalar}")
 
 
 @app.post("/webhook/messages")
