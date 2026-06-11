@@ -260,6 +260,7 @@ async def _send_audio_message(chat_id: str, text: str, tts_config: dict) -> dict
     mp3 = await tts_client.synthesize(
         text=text,
         voice_id=elevenlabs_voice_id,
+        api_key=tts_config.get("api_key", ""),
         model=tts_config.get("model", "eleven_turbo_v2_5"),
     )
     if mp3 is None:

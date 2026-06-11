@@ -3,8 +3,11 @@
 """
 Sintetiza texto a mp3 via ElevenLabs.
 
-API key compartida (master de Pablo) en env var ELEVENLABS_API_KEY.
-Si la key esta vacia, el modulo opera en no-op y retorna None directo.
+API key resolution (orden de prioridad):
+1. Parametro `api_key` pasado a synthesize() — viene del config endpoint del plugin
+   (centralizado: rotacion en un solo lugar, mismo patron que WAHA/Railway tokens).
+2. Fallback a env var ELEVENLABS_API_KEY — util para dev local / testing.
+Si ninguna esta presente, el modulo opera en no-op y retorna None directo.
 
 Trackea last_error_reason para que el caller pueda reportarlo al plugin
 como tts_errors event.
@@ -39,16 +42,21 @@ def _set_reason(reason: Optional[str]) -> None:
 async def synthesize(
     text: str,
     voice_id: str,
+    api_key: str = "",
     model: str = DEFAULT_MODEL,
     output_format: str = DEFAULT_OUTPUT_FORMAT,
 ) -> Optional[bytes]:
     """
     Convierte texto a mp3 bytes via ElevenLabs Turbo v2.5.
     Retorna bytes o None ante cualquier error. last_error_reason() trae el motivo.
+
+    api_key: si vacio, fallback a env var ELEVENLABS_API_KEY (dev/testing).
+    En produccion el plugin envia la key via /config/{token} y main.py la pasa aca.
     """
-    if not ELEVENLABS_API_KEY:
+    effective_key = api_key or ELEVENLABS_API_KEY
+    if not effective_key:
         _set_reason("no_api_key")
-        logger.warning("tts_client: ELEVENLABS_API_KEY vacia, no-op")
+        logger.warning("tts_client: sin API key (ni param ni env var), no-op")
         return None
 
     if not text or not voice_id:
@@ -57,7 +65,7 @@ async def synthesize(
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
+        "xi-api-key": effective_key,
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
     }

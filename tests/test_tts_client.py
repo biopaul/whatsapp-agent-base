@@ -117,3 +117,51 @@ async def test_synthesize_envia_payload_correcto(module_with_key):
     assert captured["json"]["model_id"] == "eleven_turbo_v2_5"
     assert "output_format" in captured["json"]
     assert captured["headers"]["xi-api-key"] == "sk-test"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_api_key_param_tiene_prioridad_sobre_env_var(module_with_key):
+    """Si se pasa api_key explicito, gana sobre la env var."""
+    captured = {}
+
+    async def fake_post(self, url, *args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _make_response(200, content=b"mp3")
+
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        await module_with_key.synthesize(
+            "hola", voice_id="v", api_key="sk-from-config"
+        )
+    # El env var era "sk-test" pero el param tiene prioridad
+    assert captured["headers"]["xi-api-key"] == "sk-from-config"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_usa_env_var_si_api_key_param_vacio(module_with_key):
+    """Fallback a env var cuando no se pasa api_key (caso dev/local)."""
+    captured = {}
+
+    async def fake_post(self, url, *args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _make_response(200, content=b"mp3")
+
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        await module_with_key.synthesize("hola", voice_id="v")  # sin api_key
+    assert captured["headers"]["xi-api-key"] == "sk-test"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_api_key_param_funciona_sin_env_var(reset_module):
+    """Sin env var, el api_key param solo es suficiente."""
+    captured = {}
+
+    async def fake_post(self, url, *args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _make_response(200, content=b"mp3")
+
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        result = await reset_module.synthesize(
+            "hola", voice_id="v", api_key="sk-from-plugin"
+        )
+    assert result == b"mp3"
+    assert captured["headers"]["xi-api-key"] == "sk-from-plugin"
