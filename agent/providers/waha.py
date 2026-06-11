@@ -363,3 +363,38 @@ class ProveedorWAHA(ProveedorWhatsApp):
                 return (True, r.status_code, msg_id)
             logger.error(f"WAHA sendList HTTP {r.status_code}: {r.text[:200]}")
             return (False, r.status_code, None)
+
+    async def enviar_audio(self, telefono: str, audio_ogg: bytes) -> str | None:
+        """WAHA /api/sendVoice. Retorna msg_id, 'ok_no_id' o None."""
+        if not self.base_url:
+            return None
+        chat_id = _asegurar_chat_id(telefono)
+        files = {
+            "file": ("audio.ogg", audio_ogg, "audio/ogg"),
+        }
+        data = {
+            "session": self.session,
+            "chatId": chat_id,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                r = await client.post(
+                    f"{self.base_url}/api/sendVoice",
+                    data=data,
+                    files=files,
+                    headers=self._headers_for_multipart(),
+                )
+            except Exception as e:
+                logger.error(f"WAHA sendVoice exception: {e}")
+                return None
+
+            if r.status_code not in (200, 201):
+                logger.error(f"WAHA sendVoice HTTP {r.status_code}: {r.text[:200]}")
+                return None
+            return _extract_msg_id(r) or "ok_no_id"
+
+    def _headers_for_multipart(self) -> dict:
+        """Headers para requests multipart (sin Content-Type - httpx lo setea con boundary)."""
+        h = dict(self._headers())
+        h.pop("Content-Type", None)
+        return h

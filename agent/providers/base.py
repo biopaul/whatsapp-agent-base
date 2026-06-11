@@ -116,3 +116,16 @@ class ProveedorWhatsApp(ABC):
         Retorna (ok, status_code, mensaje_id).
         """
         raise NotImplementedError("Provider no implementa enviar_list")
+
+    async def enviar_audio(self, telefono: str, audio_ogg: bytes) -> str | None:
+        """
+        Envia un voice note (OGG/Opus). Retorna message_id del proveedor.
+
+        Returns:
+        - str con id concreto si el proveedor lo expone.
+        - "ok_no_id" si envio OK pero sin id parseable.
+        - None ante fallo.
+
+        Default: NotImplementedError. Solo WAHA esta implementado en v1.
+        """
+        raise NotImplementedError("Provider no implementa enviar_audio")

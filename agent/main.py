@@ -19,11 +19,12 @@ from agent.brain import generar_respuesta
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp, existe_mensaje_id
 from agent import brain
 from agent.providers import obtener_proveedor
-from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at
+from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
 from agent import usage_reporter, takeover, outbound, debouncer, labels
+from agent import tts_client, audio_converter, tts_voices
 from agent import contacts_webhook
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
@@ -224,7 +225,87 @@ async def send_user_message(chat_id: str, text: str) -> bool:
     return True
 
 
-async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str | None = None) -> None:
+def _debe_enviar_audio(fue_audio: bool, tts_config: dict, text: str) -> bool:
+    """Gate combinado: debe esta respuesta salir como voice note?"""
+    if not fue_audio:
+        return False
+    if not tts_config.get("enabled"):
+        return False
+    if not tts_config.get("voice_id"):
+        return False
+    max_chars = tts_config.get("max_chars_per_message", 640)
+    if len(text) > max_chars:
+        return False
+    seconds_remaining = tts_config.get("seconds_remaining")
+    if seconds_remaining is not None and seconds_remaining <= 0:
+        return False
+    return True
+
+
+def _estimate_seconds(text: str) -> int:
+    """Estimacion empirica de duracion del audio (~16 chars/seg para espanol Turbo v2.5)."""
+    return max(1, round(len(text) / 16))
+
+
+async def _send_audio_message(chat_id: str, text: str, tts_config: dict) -> dict:
+    """
+    Pipeline TTS completo: synthesize -> convert -> send.
+    Retorna {"ok": True} o {"ok": False, "reason": str}.
+    """
+    voice_key = tts_config.get("voice_id")
+    elevenlabs_voice_id = tts_voices.resolve_voice_id(voice_key)
+    if elevenlabs_voice_id is None:
+        return {"ok": False, "reason": "voice_key_unknown"}
+
+    mp3 = await tts_client.synthesize(
+        text=text,
+        voice_id=elevenlabs_voice_id,
+        model=tts_config.get("model", "eleven_turbo_v2_5"),
+    )
+    if mp3 is None:
+        reason = tts_client.last_error_reason() or "elevenlabs_unknown"
+        return {"ok": False, "reason": reason}
+
+    ogg = await audio_converter.mp3_to_ogg_opus(mp3)
+    if ogg is None:
+        return {"ok": False, "reason": "ffmpeg_failed"}
+
+    msg_id = await proveedor.enviar_audio(chat_id, ogg)
+    if msg_id is None:
+        return {"ok": False, "reason": "waha_sendvoice_failed"}
+
+    # Persistir en historial + contabilizar usage
+    persisted_id = msg_id if msg_id != "ok_no_id" else None
+    await guardar_mensaje(chat_id, "assistant", text, mensaje_id=persisted_id)
+    usage_reporter.report_tts_used(_estimate_seconds(text))
+
+    # Fire-and-forget: notificar a WP del touch out
+    asyncio.create_task(contacts_webhook.touch_contact(
+        chat_id=chat_id, direction="out", preview=text
+    ))
+    return {"ok": True}
+
+
+async def send_audio_or_text(
+    chat_id: str,
+    text: str,
+    fue_audio: bool,
+    tts_config: dict,
+) -> bool:
+    """
+    Decide voice note vs texto basado en config + flag.
+    Fallback silencioso a texto si TTS falla.
+    """
+    if _debe_enviar_audio(fue_audio, tts_config, text):
+        result = await _send_audio_message(chat_id, text, tts_config)
+        if result["ok"]:
+            return True
+        usage_reporter.report_tts_error(chat_id, result.get("reason", "unknown"))
+        logger.warning(f"TTS fail reason={result.get('reason')} chat={chat_id} -> fallback texto")
+    return await send_user_message(chat_id, text)
+
+
+async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str | None = None, fue_audio: bool = False) -> None:
     """
     Procesa un mensaje del cliente (from_me=False).
     Orden:
@@ -286,20 +367,20 @@ async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str |
                 injected = result["injected_text"]
                 historial = await _mem.obtener_historial(chat_id)
                 respuesta = await brain.generar_respuesta(injected, historial, telefono=chat_id)
-                await _procesar_respuesta_llm(chat_id, respuesta)
+                await _procesar_respuesta_llm(chat_id, respuesta, fue_audio=fue_audio)
             return
 
     # Flujo normal
     historial = await obtener_historial(chat_id)
     respuesta = await brain.generar_respuesta(texto, historial, telefono=chat_id)
-    await _procesar_respuesta_llm(chat_id, respuesta)
+    await _procesar_respuesta_llm(chat_id, respuesta, fue_audio=fue_audio)
 
 
-async def _procesar_respuesta_llm(chat_id: str, respuesta: str) -> None:
+async def _procesar_respuesta_llm(chat_id: str, respuesta: str, fue_audio: bool = False) -> None:
     """
     Toma la salida del LLM y decide:
     - Si contiene <plantilla>X</plantilla> -> guided_dispatcher.dispatch_plantilla
-    - Si no -> send_user_message con splits normales
+    - Si no -> send_audio_or_text con splits normales (audio si fue_audio + TTS habilitado)
     """
     plantilla_name = guided_dispatcher.parse_plantilla_invocation(respuesta)
     if plantilla_name:
@@ -311,8 +392,9 @@ async def _procesar_respuesta_llm(chat_id: str, respuesta: str) -> None:
             return
         logger.warning(f"dispatch_plantilla fail: {result.get('reason')} - sending raw LLM text")
 
+    tts_config = get_tts_config()
     for parte in _dividir_partes(respuesta):
-        await send_user_message(chat_id, parte)
+        await send_audio_or_text(chat_id, parte, fue_audio=fue_audio, tts_config=tts_config)
 
 
 async def _procesar_mensaje_propio(chat_id: str, texto: str, mensaje_id: str | None = None) -> None:

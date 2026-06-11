@@ -348,3 +348,32 @@ def get_active_connectors() -> list[dict]:
     if not isinstance(connectors, list):
         return []
     return connectors
+
+
+def get_tts_config() -> dict:
+    """
+    Retorna el sub-objeto tts del config remoto, o {'enabled': False} si ausente.
+
+    Schema esperado:
+        {
+            "enabled": bool,
+            "voice_id": str | None,
+            "model": str,
+            "max_chars_per_message": int,
+            "seconds_remaining": int | None,
+        }
+
+    Backward compat: si el plugin no expone 'tts', retornamos disabled.
+    """
+    cfg = get_config()
+    if not isinstance(cfg, dict):
+        return {"enabled": False}
+    tts = cfg.get("tts")
+    if not isinstance(tts, dict):
+        return {"enabled": False}
+
+    result = dict(tts)  # copia para no mutar el cache
+    sr = result.get("seconds_remaining")
+    if isinstance(sr, int) and sr < 0:
+        result["seconds_remaining"] = 0
+    return result

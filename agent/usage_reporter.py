@@ -38,6 +38,27 @@ _task: Optional[asyncio.Task] = None
 _bad_token: bool = False
 _started: bool = False
 
+# === TTS USAGE TRACKING ===
+_tts_seconds_acumulados: int = 0
+_tts_errors_acumulados: list[dict] = []
+
+
+def report_tts_used(seconds: int) -> None:
+    """Acumula seconds de TTS usados. Se envia en el proximo batch exitoso."""
+    global _tts_seconds_acumulados
+    if seconds > 0:
+        _tts_seconds_acumulados += int(seconds)
+
+
+def report_tts_error(chat_id: str, reason: str) -> None:
+    """Acumula errores de TTS. Se envian en el proximo batch como tts_errors."""
+    global _tts_errors_acumulados
+    _tts_errors_acumulados.append({
+        "chat_id": chat_id,
+        "reason": reason,
+        "at": int(time.time()),
+    })
+
 
 async def start(url: str = "") -> None:
     """
@@ -112,19 +133,27 @@ async def _drain_loop() -> None:
 
 async def _send_with_retry(events: list[dict]) -> None:
     """Envia el batch con reintentos exponenciales."""
-    global _bad_token
+    global _bad_token, _tts_seconds_acumulados, _tts_errors_acumulados
 
     backoff = 2.0
     for attempt in range(_MAX_RETRIES):
         try:
+            payload = {"version": __version__, "events": events}
+            if _tts_seconds_acumulados > 0:
+                payload["tts_seconds_used"] = _tts_seconds_acumulados
+            if _tts_errors_acumulados:
+                payload["tts_errors"] = list(_tts_errors_acumulados)
+
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     USAGE_URL,
-                    json={"version": __version__, "events": events},
+                    json=payload,
                     headers={"Content-Type": "application/json"},
                 )
 
             if resp.status_code == 200:
+                _tts_seconds_acumulados = 0
+                _tts_errors_acumulados = []
                 data = resp.json()
                 logger.info(
                     f"Usage OK: inserted={data.get('inserted', '?')} "
