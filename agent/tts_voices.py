@@ -16,14 +16,13 @@ los placeholders abajo por los voice_ids reales antes del primer deploy producti
 from typing import Optional
 
 
-# Voice IDs placeholders — REEMPLAZAR antes de produccion con IDs reales de ElevenLabs
 VOICES: dict[str, dict] = {
-    "AR_M_v1": {"voice_id": "PLACEHOLDER_AR_M", "label": "Argentina - Hombre"},
-    "AR_F_v1": {"voice_id": "PLACEHOLDER_AR_F", "label": "Argentina - Mujer"},
-    "CO_M_v1": {"voice_id": "PLACEHOLDER_CO_M", "label": "Colombia - Hombre"},
-    "CO_F_v1": {"voice_id": "PLACEHOLDER_CO_F", "label": "Colombia - Mujer"},
-    "ES_M_v1": {"voice_id": "PLACEHOLDER_ES_M", "label": "Espana - Hombre"},
-    "ES_F_v1": {"voice_id": "PLACEHOLDER_ES_F", "label": "Espana - Mujer"},
+    "AR_M_v1": {"voice_id": "QK4xDwo9ESPHA4JNUpX3", "label": "Argentina - Hombre"},
+    "AR_F_v1": {"voice_id": "4wDRKlxcHNOFO5kBvE81", "label": "Argentina - Mujer"},
+    "CO_M_v1": {"voice_id": "ECOET12tGKHdXyB0CfqU", "label": "Colombia - Hombre"},
+    "CO_F_v1": {"voice_id": "VmejBeYhbrcTPwDniox7", "label": "Colombia - Mujer"},
+    "ES_M_v1": {"voice_id": "j41pQugxGaKleSQLIyG2", "label": "Espana - Hombre"},
+    "ES_F_v1": {"voice_id": "ERYLdjEaddaiN9sDjaMX", "label": "Espana - Mujer"},
 }
 
 
