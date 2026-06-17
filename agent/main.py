@@ -19,7 +19,7 @@ from agent.brain import generar_respuesta
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp, existe_mensaje_id
 from agent import brain
 from agent.providers import obtener_proveedor
-from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config
+from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config, is_solo_mode
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
@@ -549,8 +549,12 @@ async def _procesar_y_responder(
         logger.info(f"Pre-bloqueado {chat_id} ({_silencios_consecutivos(historial)} silencios consecutivos)")
         return
 
-    # Escalado por keyword -- el cliente pide explicitamente un humano
-    if _detectar_keyword_escalar(texto):
+    # Escalado por keyword -- el cliente pide explicitamente un humano.
+    # En modo individual saltamos esta rama: no hay equipo a quien escalar,
+    # asi que dejamos que el LLM responda con el bloque "MODO INDIVIDUAL"
+    # del system prompt (que le explica que tiene que asegurarle al cliente
+    # que la persona que atiende es la unica disponible).
+    if not is_solo_mode() and _detectar_keyword_escalar(texto):
         respuesta_kw = "Te conecto con alguien del equipo, en unos minutos te escriben por aca."
         await guardar_mensaje(chat_id, "user", texto)
         delay = max(1, min(round(len(respuesta_kw) * 0.025), 5))
@@ -593,11 +597,26 @@ async def _procesar_y_responder(
         return
 
     # Detectar senal de escalado: ESCALAR: <motivo>\n<mensaje al cliente>
+    # En modo individual el bloque del system prompt le dice al LLM que NO emita
+    # el marcador. Defensa profunda: si igual aparece (modelo desobedece o cache
+    # antiguo de prompt), lo limpiamos del texto pero NO disparamos escalacion
+    # (no hay equipo a quien escalar). Loggeamos para auditoria.
     motivo_escalar = None
     if respuesta.startswith("ESCALAR:"):
         primera_linea, _, resto = respuesta.partition("\n")
-        motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
-        respuesta = resto.strip()
+        if is_solo_mode():
+            logger.warning(
+                f"ESCALAR: emitido en modo solo (LLM ignoro instruccion); "
+                f"limpiando marker sin disparar escalacion. chat={chat_id} "
+                f"motivo='{primera_linea[len('ESCALAR:'):].strip()[:80]}'"
+            )
+            resto_limpio = resto.strip()
+            # Si el LLM solo emitio el marker sin texto para el cliente, usamos
+            # un fallback amable para no enviar mensaje vacio.
+            respuesta = resto_limpio if resto_limpio else "Decime, ¿en qué puedo ayudarte?"
+        else:
+            motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
+            respuesta = resto.strip()
 
     # Detectar señal de envio de archivo: ENVIAR_ARCHIVO:<nombre>
     archivo_nombre: str | None = None

@@ -163,6 +163,20 @@ def get_pause_reason() -> str | None:
     return _pause_reason
 
 
+def is_solo_mode() -> bool:
+    """
+    True si el cliente activó "Modo individual / Sin equipo" en su panel WP.
+    Implica que el agente NO debe mencionar equipo, NO debe prometer derivación
+    a otro humano, y NO debe emitir el marcador ESCALAR: (porque no hay a quien
+    escalar). Default: False (modo con equipo, comportamiento histórico).
+
+    El plugin WP serializa esto en /config/{token} como top-level "solo_mode"
+    (bool). Si no viene, asumimos False.
+    """
+    raw = get_config().get("solo_mode", False)
+    return bool(raw)
+
+
 # ---------------------------------------------------------------------------
 # Helpers de configuracion
 # ---------------------------------------------------------------------------
