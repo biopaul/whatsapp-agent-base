@@ -9,6 +9,7 @@ modelo completo para consultas complejas.
 """
 
 import os
+import re
 import json
 import logging
 from openai import AsyncOpenAI
@@ -32,6 +33,33 @@ client = AsyncOpenAI(
 
 # Maximo de tokens por respuesta.
 _MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
+
+# Rango Unicode amplio de emojis para detectar mensajes formados solo por
+# pictografias. Incluye Emoticons, Symbols & Pictographs (con extensiones),
+# Transport, Misc Symbols, Dingbats, Flags, modificadores y ZWJ. Tambien
+# permite caracteres de variation selector y espacios entre emojis.
+_EMOJI_REGEX = re.compile(
+    r'['
+    r'\U0001F300-\U0001F9FF'    # Symbols & Pictographs (incluye 😎, 🎉, 🔥)
+    r'\U0001FA00-\U0001FAFF'    # Symbols & Pictographs Extended-A
+    r'\U0001F600-\U0001F64F'    # Emoticons (😀-🙏)
+    r'\U0001F680-\U0001F6FF'    # Transport & Map
+    r'\U0001F1E6-\U0001F1FF'    # Banderas regionales
+    r'\U00002600-\U000027BF'    # Misc Symbols + Dingbats (☀️, ✅, ❤️)
+    r'\U0001F900-\U0001F9FF'    # Supplemental Symbols
+    r'\U0000FE00-\U0000FE0F'    # Variation selectors (FE0F)
+    r'‍'                   # Zero-width joiner (para emojis compuestos)
+    r']+',
+    flags=re.UNICODE,
+)
+
+
+def _solo_emojis(texto: str) -> bool:
+    """True si el mensaje (sin espacios) esta formado unicamente por emojis."""
+    if not texto or not texto.strip():
+        return False
+    sin_emojis = _EMOJI_REGEX.sub('', texto).strip()
+    return sin_emojis == ''
 
 # Prefixes de modelos que soportan function calling en OpenRouter.
 TOOL_USE_PREFIXES = (
@@ -152,8 +180,27 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
         contexto_extra: contexto adicional para esta respuesta puntual.
         telefono: telefono del cliente (para inyectar en tool calls + lookup contacto).
     """
-    if not mensaje or len(mensaje.strip()) < 2:
+    # Bloquear solo mensajes verdaderamente vacios. Emojis sueltos (len=1)
+    # antes caian aqui y disparaban fallback_message sin llegar al LLM.
+    # Ahora pasan: el LLM entiende los emojis nativamente.
+    if not mensaje or not mensaje.strip():
         return get_fallback_message()
+
+    # Si el mensaje es solo emojis, agregar un hint al contexto para que el LLM
+    # los interprete como reaccion/emocion del cliente en lugar de tratarlos
+    # como una pregunta concreta. El emoji per se ya esta en `mensaje` y va
+    # como user turn al modelo — esto solo agrega la guia interpretativa.
+    if _solo_emojis(mensaje):
+        emoji_hint = (
+            f"NOTA: el cliente envió un mensaje compuesto solo por emojis: {mensaje.strip()}. "
+            "Interprétalo como una reacción emocional o expresiva en relación a tu último "
+            "mensaje y al hilo reciente de la conversación, NO como una pregunta. "
+            "Responde de forma natural, breve (1 oración suele alcanzar) y conectada al "
+            "contexto. Si el contexto no permite interpretarlo, devuelve una respuesta "
+            "cordial que invite a continuar el tema actual sin pedir explícitamente que "
+            "el cliente reformule."
+        )
+        contexto_extra = f"{contexto_extra}\n\n{emoji_hint}".strip() if contexto_extra else emoji_hint
 
     # === STATIC PORTION (cacheable) ===
     # Esta parte es identica entre llamadas para el mismo agente.
