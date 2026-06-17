@@ -14,7 +14,7 @@ import json
 import logging
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agent.config_loader import get_ai_models, get_system_prompt, get_fallback_message, get_error_message, get_active_connectors
+from agent.config_loader import get_ai_models, get_system_prompt, get_fallback_message, get_error_message, get_active_connectors, is_solo_mode
 from agent.knowledge_loader import get_knowledge_text, get_public_docs
 from agent.connectors.registry import get_tools_for_connector, build_connectors_context
 from agent.connectors.executor import execute_tool
@@ -80,7 +80,12 @@ TOOL_USE_FALLBACK_MODEL = "anthropic/claude-3-5-haiku"
 # hablar en otro dialecto (rioplatense, mexicano, etc.), debe indicarlo
 # explícitamente el system prompt del cliente — ese prompt tiene prioridad
 # sobre las preferencias implícitas de esta capa.
-_WHATSAPP_NATURALNESS = """\
+#
+# La parte BASE es siempre la misma. El bloque ESCALACION cambia dinamicamente
+# segun is_solo_mode(): por default se asume que hay equipo. Cuando el cliente
+# activa "Modo individual / Sin equipo" en su panel WP, se inyecta una variante
+# que prohibe al modelo mencionar equipo o esperar intervencion humana.
+_WHATSAPP_NATURALNESS_BASE = """\
 Estás chateando con clientes por WhatsApp. Reglas de comunicación:
 
 FORMATO
@@ -106,6 +111,10 @@ IDIOMA Y DIALECTO
 - NO uses voseo rioplatense (vos/tenés/podés/sos/hacés) a menos que el system prompt principal del cliente lo solicite explícitamente o que el usuario te esté hablando claramente en voseo.
 - Estas reglas mismas están escritas en neutro para evitar que su tono se contagie. Tu salida debe seguir las indicaciones del system prompt del cliente, no el dialecto de estas instrucciones.
 
+"""
+
+# Bloque ESCALACION cuando el negocio tiene equipo (default).
+_ESCALATION_BLOCK_TEAM = """\
 ESCALACIÓN A HUMANO
 - SÍ tienes capacidad de derivar al cliente a una persona del equipo. NO digas que no puedes derivar, no digas que en este chat solo puedes ayudar tú, no digas que no tienes la capacidad de transferir. Eso es FALSO.
 - CÓMO escalar: empieza tu respuesta con el marcador literal "ESCALAR: <motivo breve>" en la PRIMERA línea y después, en líneas siguientes, el mensaje al cliente. El cliente NO ve el "ESCALAR:" — el sistema lo procesa y lo elimina antes de enviar. Ejemplo:
@@ -119,6 +128,32 @@ ESCALACIÓN A HUMANO
 - DESPUÉS de escalar, tú NO sigues respondiendo en ese chat hasta que el humano intervenga. Tu mensaje de escalación es el último por un rato — no añadas más preguntas tipo "¿algo más?".
 
 """
+
+# Bloque ESCALACION cuando el negocio funciona en modo individual / sin equipo.
+# Anula explicitamente la nocion de "equipo" y le dice al modelo que es el unico
+# punto de contacto. Sustituye la herramienta de derivacion por un patron de
+# contencion: confirmar al cliente que la persona que esta respondiendo es la
+# que lo va a atender.
+_ESCALATION_BLOCK_SOLO = """\
+MODO INDIVIDUAL — NO HAY EQUIPO
+- Este negocio funciona en modo individual: NO hay equipo, NO hay otro asesor, NO hay otra persona que pueda recibir el chat. La única persona disponible para atender al cliente sos vos.
+- NUNCA digas "te conecto con alguien del equipo", "te voy a derivar", "un compañero te va a contactar", "un asesor humano te va a escribir" ni variaciones. Eso es FALSO en este negocio.
+- NUNCA emitas el marcador "ESCALAR:" en tus respuestas. No tienes a quién escalar — el marcador no existe en este modo y emitirlo dejará al cliente sin respuesta.
+- Si el cliente pide hablar con un humano, una persona real, un asesor, el dueño o similar:
+    * Confirmale con naturalidad que vos sos la persona que lo atiende directamente, que no hay intermediarios, y seguí con la conversación según el system prompt principal del negocio.
+    * Ejemplo (adaptá al tono del negocio): "Soy yo quien te atiende personalmente, contame qué necesitás y vemos cómo resolverlo."
+- Si el cliente está frustrado o tiene una queja:
+    * Mostrá empatía, escuchá, ofrecé tu ayuda directa.
+    * Si no podés resolverlo dentro de tu rol, sugerí un canal externo apropiado (un profesional de la salud, un abogado, etc.) SIN prometer una derivación interna que no existe.
+- Si el cliente menciona una urgencia médica, legal o de seguridad grave que excede tu rol, recomendá un canal externo apropiado (servicios de emergencia, profesional especializado) y NO digas que vas a derivarlo internamente.
+
+"""
+
+
+def _whatsapp_naturalness() -> str:
+    """Compone la capa de naturalidad final segun el modo del agente."""
+    block = _ESCALATION_BLOCK_SOLO if is_solo_mode() else _ESCALATION_BLOCK_TEAM
+    return _WHATSAPP_NATURALNESS_BASE + block
 
 
 def _is_anthropic_model(model: str) -> bool:
@@ -207,7 +242,7 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     # Cuando un modelo Anthropic la procesa, marcamos cache_control: ephemeral
     # para que su API la cachee y subsiguientes llamadas paguen ~10% del costo.
     # Para OpenAI/DeepSeek/Gemini2.5, el caching es automatico sobre prefijos identicos.
-    static_parts: list[str] = [_WHATSAPP_NATURALNESS, get_system_prompt()]
+    static_parts: list[str] = [_whatsapp_naturalness(), get_system_prompt()]
 
     # Plantillas guiadas activas (RESPUESTAS GUIADAS)
     try:
