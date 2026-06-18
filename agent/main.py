@@ -635,6 +635,21 @@ async def _procesar_y_responder(
         )
         contexto = f"{contexto}\n{nota_multi}".strip() if contexto else nota_multi
 
+    # Si el cliente mando audio y TTS esta activo, informarle al LLM que su respuesta
+    # se va a convertir a voz. Evita que diga "no puedo mandar audios" (el sistema
+    # lo hace por el). Solo se inyecta cuando TTS esta realmente disponible.
+    if fue_audio:
+        _tts_cfg_for_prompt = get_tts_config()
+        if _tts_cfg_for_prompt.get("enabled") and _tts_cfg_for_prompt.get("voice_id"):
+            nota_audio = (
+                "El cliente envio una nota de voz. Tu respuesta sera convertida "
+                "automaticamente a audio y enviada como nota de voz. Respondé "
+                "naturalmente — NO digas que no podes mandar audios, porque si podes "
+                "(el sistema lo hace por vos). Mantene la respuesta concisa porque "
+                "el cliente la va a escuchar."
+            )
+            contexto = f"{contexto}\n{nota_audio}".strip() if contexto else nota_audio
+
     # Generar respuesta con Claude
     respuesta = await generar_respuesta(texto, historial, contexto, telefono=chat_id)
 
