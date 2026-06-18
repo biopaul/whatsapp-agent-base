@@ -1,2 +1,2 @@
 # agent/__init__.py — Package init + version
-__version__ = "1.8.1"
+__version__ = "1.8.2"
