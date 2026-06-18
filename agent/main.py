@@ -677,6 +677,9 @@ async def _procesar_y_responder(
     # Dividir en partes si Claude uso separador ---
     partes = _dividir_partes(respuesta)
 
+    # TTS config: si fue_audio + gates OK, send_audio_or_text envia voice note
+    tts_config = get_tts_config()
+
     for idx, parte in enumerate(partes):
         delay = max(1, min(round(len(parte) * 0.025), 5))
         if idx == 0:
@@ -689,7 +692,7 @@ async def _procesar_y_responder(
             # Partes siguientes: siempre "escribiendo" con pausa realista
             await proveedor.indicar_escribiendo(chat_id, delay)
         await asyncio.sleep(delay)
-        await send_user_message(chat_id, parte)
+        await send_audio_or_text(chat_id, parte, fue_audio=fue_audio, tts_config=tts_config)
 
     logger.info(
         f"Respuesta a {chat_id} ({len(partes)} parte/s, {message_count} msg combinados): "
