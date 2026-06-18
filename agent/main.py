@@ -306,6 +306,55 @@ async def send_audio_or_text(
     return await send_user_message(chat_id, text)
 
 
+async def _handle_testaudio_command(chat_id: str) -> None:
+    """
+    Comando /testaudio — fuerza envio de audio de prueba bypassando el gate de
+    fue_audio. Si los demas gates fallan o el pipeline TTS falla, responde
+    texto con diagnostico detallado de la causa.
+    """
+    test_text = "Esta es una prueba de audio."
+    tts_config = get_tts_config()
+
+    def _diag_lines() -> list[str]:
+        api_key_status = "yes" if tts_config.get("api_key") else "no (verificando env var fallback)"
+        sr = tts_config.get("seconds_remaining")
+        sr_str = "unlimited" if sr is None else str(sr)
+        return [
+            f"• tts.enabled = {tts_config.get('enabled', False)}",
+            f"• tts.voice_id = {tts_config.get('voice_id', None)}",
+            f"• tts.api_key configured = {api_key_status}",
+            f"• tts.seconds_remaining = {sr_str}",
+            f"• tts.max_chars_per_message = {tts_config.get('max_chars_per_message', 640)}",
+        ]
+
+    # Pre-checks
+    if not tts_config.get("enabled"):
+        msg = "❌ TTS no habilitado para este agente.\n\n" + "\n".join(_diag_lines())
+        await send_user_message(chat_id, msg)
+        return
+    if not tts_config.get("voice_id"):
+        msg = "❌ Voice ID no configurada.\n\n" + "\n".join(_diag_lines())
+        await send_user_message(chat_id, msg)
+        return
+    sr = tts_config.get("seconds_remaining")
+    if sr is not None and sr <= 0:
+        msg = "❌ Budget de TTS agotado para este mes.\n\n" + "\n".join(_diag_lines())
+        await send_user_message(chat_id, msg)
+        return
+
+    # Intento TTS real
+    result = await _send_audio_message(chat_id, test_text, tts_config)
+    if result["ok"]:
+        # Audio enviado — no hace falta diagnostico
+        return
+
+    # Pipeline TTS fallo — reportar la causa
+    reason = result.get("reason", "unknown")
+    usage_reporter.report_tts_error(chat_id, reason)
+    msg = f"❌ TTS pipeline fallo: {reason}\n\n" + "\n".join(_diag_lines())
+    await send_user_message(chat_id, msg)
+
+
 async def _procesar_mensaje_entrante(chat_id: str, texto: str, mensaje_id: str | None = None, fue_audio: bool = False) -> None:
     """
     Procesa un mensaje del cliente (from_me=False).
@@ -758,6 +807,11 @@ async def webhook_handler(request: Request):
             # Comando /version — responde sin llamar a Claude ni contar como mensaje
             if msg.texto.strip().lower() == "/version":
                 await send_user_message(msg.telefono, _respuesta_version())
+                continue
+
+            # Comando /testaudio — fuerza audio de prueba (bypassa gate fue_audio)
+            if msg.texto.strip().lower() == "/testaudio":
+                await _handle_testaudio_command(msg.telefono)
                 continue
 
             # Reaccion contextual al mensaje (feedback inmediato antes del debounce)
