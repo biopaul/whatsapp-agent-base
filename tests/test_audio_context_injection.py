@@ -83,17 +83,32 @@ async def test_no_inyecta_nota_si_fue_audio_false():
 
 
 @pytest.mark.asyncio
-async def test_no_inyecta_nota_si_tts_disabled():
-    """fue_audio=True pero TTS deshabilitado → no se inyecta (seria mentirle al LLM)."""
+async def test_inyecta_nota_alternativa_si_tts_disabled():
+    """fue_audio=True pero TTS deshabilitado → inyecta nota alternativa para evitar disclaimers."""
     cfg = {"enabled": False}
     contexto = await _capture_contexto(fue_audio=True, tts_cfg=cfg)
-    assert "nota de voz" not in contexto.lower()
-    assert "no podes mandar audios" not in contexto.lower()
+    # Hay nota (cliente envio audio)
+    assert "nota de voz" in contexto.lower()
+    # Pero le dice al LLM que solo puede texto + sin disculpas
+    assert "solo pod" in contexto.lower() and "texto" in contexto.lower()
+    assert "no le expliques" in contexto.lower()
+    assert "ni te disculpes" in contexto.lower()
 
 
 @pytest.mark.asyncio
-async def test_no_inyecta_nota_si_voice_id_vacia():
-    """fue_audio=True + enabled=True pero sin voice_id → no inyecta."""
+async def test_inyecta_nota_alternativa_si_voice_id_vacia():
+    """fue_audio=True + enabled=True pero sin voice_id → inyecta nota alternativa."""
     cfg = {"enabled": True, "voice_id": None}
     contexto = await _capture_contexto(fue_audio=True, tts_cfg=cfg)
-    assert "no podes mandar audios" not in contexto.lower()
+    assert "nota de voz" in contexto.lower()
+    assert "solo pod" in contexto.lower() and "texto" in contexto.lower()
+
+
+@pytest.mark.asyncio
+async def test_nota_disabled_no_confunde_con_nota_enabled():
+    """Cuando TTS deshabilitado, NO se incluye la nota positiva de 'sera convertida a audio'."""
+    cfg = {"enabled": False}
+    contexto = await _capture_contexto(fue_audio=True, tts_cfg=cfg)
+    # La nota positiva NO debe aparecer
+    assert "sera convertida" not in contexto.lower()
+    assert "automaticamente a audio" not in contexto.lower()
