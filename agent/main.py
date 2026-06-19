@@ -24,7 +24,7 @@ from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
 from agent import usage_reporter, takeover, outbound, debouncer, labels
-from agent import tts_client, audio_converter, tts_voices
+from agent import tts_client, audio_converter, tts_voices, tts_text_cleaner
 from agent import contacts_webhook
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
@@ -257,8 +257,15 @@ async def _send_audio_message(chat_id: str, text: str, tts_config: dict) -> dict
     if elevenlabs_voice_id is None:
         return {"ok": False, "reason": "voice_key_unknown"}
 
+    # Sanitizar texto antes de TTS: quitar emojis, risas escritas, markdown,
+    # puntuacion repetida (defense in depth — el LLM ya recibe la instruccion,
+    # esto garantiza limpieza si el modelo se escapa).
+    text_clean = tts_text_cleaner.sanitize_for_tts(text)
+    if not text_clean:
+        return {"ok": False, "reason": "empty_after_sanitize"}
+
     mp3 = await tts_client.synthesize(
-        text=text,
+        text=text_clean,
         voice_id=elevenlabs_voice_id,
         api_key=tts_config.get("api_key", ""),
         model=tts_config.get("model", "eleven_turbo_v2_5"),
@@ -645,10 +652,16 @@ async def _procesar_y_responder(
         if _tts_cfg_for_prompt.get("enabled") and _tts_cfg_for_prompt.get("voice_id"):
             nota_audio = (
                 "El cliente envio una nota de voz. Tu respuesta sera convertida "
-                "automaticamente a audio y enviada como nota de voz. Respondé "
-                "naturalmente — NO digas que no podes mandar audios, porque si podes "
-                "(el sistema lo hace por vos). Mantene la respuesta concisa porque "
-                "el cliente la va a escuchar."
+                "automaticamente a audio y enviada como nota de voz. Por eso, "
+                "escribi como si estuvieras hablando, no chateando:\n"
+                "- NO uses emojis (se leerian como 'carita feliz', 'manos juntas', etc).\n"
+                "- NO escribas risas tipo 'jaja', 'jeje', 'lol', 'xd' (se leen literal "
+                "y suenan robotico).\n"
+                "- NO uses markdown (asteriscos, guiones bajos, comillas invertidas).\n"
+                "- NO uses puntuacion exagerada (!!!, ???, ...).\n"
+                "- Mantene la respuesta concisa porque el cliente la va a escuchar.\n"
+                "- NO digas que no podes mandar audios, porque si podes "
+                "(el sistema lo hace por vos)."
             )
         else:
             nota_audio = (

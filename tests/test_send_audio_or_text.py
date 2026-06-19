@@ -108,3 +108,52 @@ async def test_send_audio_or_text_fallback_a_texto_si_tts_falla():
     assert result is True
     mock_audio.assert_awaited_once()
     mock_text.assert_awaited_once_with("c@c.us", "hola")
+
+
+@pytest.mark.asyncio
+async def test_send_audio_message_sanitiza_texto_antes_de_tts():
+    """El texto pasado a tts_client.synthesize debe estar sanitizado (sin emojis, risas, etc.)."""
+    from agent import main as agent_main
+    from agent import tts_client, audio_converter, tts_voices
+
+    captured_text = {}
+
+    async def fake_synthesize(text, voice_id, api_key="", model=None, output_format=None):
+        captured_text["text"] = text
+        return b"FAKE_MP3"
+
+    async def fake_convert(mp3):
+        return b"FAKE_OGG"
+
+    with patch.object(tts_voices, "resolve_voice_id", return_value="elabs_id"), \
+         patch.object(tts_client, "synthesize", new=fake_synthesize), \
+         patch.object(audio_converter, "mp3_to_ogg_opus", new=fake_convert), \
+         patch.object(agent_main.proveedor, "enviar_audio",
+                      new=AsyncMock(return_value="msg_001")), \
+         patch.object(agent_main, "guardar_mensaje", new=AsyncMock()), \
+         patch.object(agent_main.usage_reporter, "report_tts_used",
+                      new=lambda s: None):
+        cfg = _tts_cfg()
+        await agent_main._send_audio_message(
+            "c@c.us", "Hola jaja 😊 que **bueno**!!!", cfg
+        )
+
+    txt = captured_text["text"]
+    assert "😊" not in txt
+    assert "jaja" not in txt.lower()
+    assert "**" not in txt
+    assert "!!!" not in txt
+    assert "Hola" in txt and "bueno" in txt
+
+
+@pytest.mark.asyncio
+async def test_send_audio_message_falla_si_texto_queda_vacio_post_sanitize():
+    """Si el sanitize deja string vacio (solo emojis), retorna fail con reason claro."""
+    from agent import main as agent_main
+    from agent import tts_voices
+
+    with patch.object(tts_voices, "resolve_voice_id", return_value="elabs_id"):
+        result = await agent_main._send_audio_message("c@c.us", "😊😊😊", _tts_cfg())
+
+    assert result["ok"] is False
+    assert result["reason"] == "empty_after_sanitize"
