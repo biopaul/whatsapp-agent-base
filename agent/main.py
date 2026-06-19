@@ -225,6 +225,47 @@ async def send_user_message(chat_id: str, text: str) -> bool:
     return True
 
 
+_ENGAGEMENT_INSTRUCTIONS = {
+    5: "",
+    4: (
+        "Nivel de respuesta ALTO: responde casi todos los mensajes. "
+        "Emiti SILENCIO solo si el mensaje es un acuse vacio sin contenido "
+        "(ej: 'ok', 'dale', 'gracias', 'ya esta') que no requiere respuesta."
+    ),
+    3: (
+        "Nivel de respuesta MEDIO: responde solo si el mensaje tiene sustancia "
+        "(una pregunta concreta, un pedido, o contenido nuevo relevante). "
+        "Si es chitchat sin contenido, comentario social, o acuse: emiti SILENCIO."
+    ),
+    2: (
+        "Nivel de respuesta BAJO: responde solo si el mensaje toca temas "
+        "relacionados con tu negocio o tus objetivos configurados. "
+        "Para cualquier mensaje off-topic, social, o sin relacion clara con "
+        "lo que ofreces: emiti SILENCIO."
+    ),
+    1: (
+        "Nivel de respuesta MINIMO: responde unicamente si el mensaje encaja "
+        "ESTRICTAMENTE con los objetivos exactos de tu rol configurado. "
+        "Cualquier mensaje fuera de esos objetivos —aunque sea cordial o "
+        "relacionado tangencialmente— emiti SILENCIO sin excepcion."
+    ),
+}
+
+
+def _engagement_instruction(level) -> str:
+    """
+    Retorna la instruccion para el LLM segun el nivel de disposicion a responder
+    audios (1-5). Default 5 (sin restriccion) si el valor es invalido o ausente.
+    """
+    try:
+        lvl = int(level)
+    except (TypeError, ValueError):
+        lvl = 5
+    if lvl < 1 or lvl > 5:
+        lvl = 5
+    return _ENGAGEMENT_INSTRUCTIONS.get(lvl, "")
+
+
 def _debe_enviar_audio(fue_audio: bool, tts_config: dict, text: str) -> bool:
     """Gate combinado: debe esta respuesta salir como voice note?"""
     if not fue_audio:
@@ -663,6 +704,13 @@ async def _procesar_y_responder(
                 "- NO digas que no podes mandar audios, porque si podes "
                 "(el sistema lo hace por vos)."
             )
+            # Disposicion a responder audios (1-5). Solo aplica cuando la
+            # respuesta saldria como audio; ahorra budget TTS frenando bucles.
+            engagement = _engagement_instruction(
+                _tts_cfg_for_prompt.get("audio_engagement_level")
+            )
+            if engagement:
+                nota_audio = f"{nota_audio}\n{engagement}"
         else:
             nota_audio = (
                 "El cliente envio una nota de voz. En este momento solo podes "
