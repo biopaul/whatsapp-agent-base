@@ -170,6 +170,10 @@ async def _es_nueva_sesion(telefono: str) -> bool:
     """
     Retorna True si el último mensaje fue de un día diferente (en hora Argentina)
     o si no hay historial previo.
+
+    DEPRECATED para flujo de retoma — usar _horas_desde_ultimo_mensaje() y la
+    clasificación en 3 estados (primer contacto / continua / retoma) en
+    _procesar_y_responder.
     """
     ultimo = await obtener_ultimo_timestamp(telefono)
     if ultimo is None:
@@ -178,6 +182,54 @@ async def _es_nueva_sesion(telefono: str) -> bool:
     ahora = datetime.now(tz_local)
     ultimo_local = ultimo.replace(tzinfo=timezone.utc).astimezone(tz_local)
     return ahora.date() != ultimo_local.date()
+
+
+# --- Retoma de conversación tras pausa larga ---
+# Threshold para considerar que el cliente "vuelve" a la charla (no continua).
+# Por encima del threshold, el LLM recibe instrucciones para retomar con
+# familiaridad en lugar de saludar como nuevo.
+RETOMA_HORAS_THRESHOLD = float(os.getenv("RETOMA_HORAS_THRESHOLD", "12"))
+
+# Límite de mensajes a cargar cuando es retoma — más contexto para que el
+# LLM pueda mencionar temas previos con naturalidad.
+HISTORIAL_RETOMA_LIMIT = int(os.getenv("HISTORIAL_RETOMA_LIMIT", "40"))
+
+
+async def _horas_desde_ultimo_mensaje(telefono: str) -> float | None:
+    """
+    Horas transcurridas desde el último mensaje del chat. None si no hay
+    historial previo (primer contacto).
+    """
+    ultimo = await obtener_ultimo_timestamp(telefono)
+    if ultimo is None:
+        return None
+    tz_local = timezone(timedelta(hours=get_tz_offset()))
+    ahora = datetime.now(tz_local)
+    ultimo_local = ultimo.replace(tzinfo=timezone.utc).astimezone(tz_local)
+    return (ahora - ultimo_local).total_seconds() / 3600.0
+
+
+def _formatear_tiempo_pausa(horas: float) -> str:
+    """Convierte horas en una descripción natural ('hace 2 días', 'ayer', etc.)."""
+    if horas < 24:
+        h = int(round(horas))
+        if h <= 1:
+            return "hace alrededor de una hora"
+        return f"hace {h} horas"
+    dias = int(round(horas / 24))
+    if dias == 1:
+        return "ayer"
+    if dias < 7:
+        return f"hace {dias} días"
+    semanas = int(round(dias / 7))
+    if semanas == 1:
+        return "hace una semana"
+    if semanas < 4:
+        return f"hace {semanas} semanas"
+    meses = int(round(dias / 30))
+    if meses == 1:
+        return "hace alrededor de un mes"
+    return f"hace alrededor de {meses} meses"
 
 load_dotenv()
 
@@ -637,7 +689,28 @@ async def _procesar_y_responder(
       - No es el comando /version
     """
     caps = get_capabilities()
-    historial = await obtener_historial(chat_id)
+
+    # Clasificar el estado de la conversación en 3 casos:
+    #   - primer contacto  -> sin historial previo, el system_prompt del cliente
+    #                         maneja el saludo inicial.
+    #   - continua         -> historial reciente (<= threshold horas).
+    #   - retoma           -> volvió después de pausa larga (> threshold horas):
+    #                         cargamos más historial y le damos al LLM un hint
+    #                         explícito para retomar el hilo en vez de saludar
+    #                         como nuevo.
+    horas_pausa = await _horas_desde_ultimo_mensaje(chat_id)
+    es_primer_contacto = horas_pausa is None
+    es_retoma = (horas_pausa is not None) and (horas_pausa >= RETOMA_HORAS_THRESHOLD)
+
+    # En retoma cargamos más mensajes para que el LLM vea bien el hilo previo.
+    limite_historial = HISTORIAL_RETOMA_LIMIT if es_retoma else 20
+    historial = await obtener_historial(chat_id, limite=limite_historial)
+
+    if es_retoma and horas_pausa is not None:
+        logger.info(
+            f"Retoma de conversación detectada chat={chat_id} pausa={horas_pausa:.1f}h "
+            f"historial_msgs={len(historial)}"
+        )
 
     # Pre-bloquear si hay silencios consecutivos recientes (sin llamar a Claude)
     if _debe_prebloquear(historial):
@@ -662,15 +735,39 @@ async def _procesar_y_responder(
         logger.info(f"Escalado por keyword: {chat_id}")
         return
 
-    # Detectar si es nueva sesion (nuevo dia) — solo informar la hora, no prescribir formato
+    # Construcción del contexto según el estado clasificado arriba.
     contexto = ""
-    if await _es_nueva_sesion(chat_id):
+    if es_retoma and horas_pausa is not None:
+        # Hint fuerte: retomar el hilo con familiaridad, NO saludar como nuevo,
+        # NO presentarse de nuevo (el cliente ya sabe quién es el agente).
+        tiempo_str = _formatear_tiempo_pausa(horas_pausa)
+        contexto = (
+            f"RETOMA DE CONVERSACIÓN: este cliente ya tuvo una conversación contigo {tiempo_str}. "
+            f"Toda la conversación previa está en el historial reciente. "
+            f"NO te presentes ni uses el saludo inicial del system prompt — el cliente ya sabe quién eres "
+            f"y, si te presentaste antes en el historial, NO vuelvas a hacerlo. "
+            f"Saluda con familiaridad, usando su nombre si aparece en los datos del cliente o en el historial. "
+            f"Si en la última conversación quedó algo concreto sin cerrar (una compra a definir, una duda pendiente, "
+            f"un tema personal que el cliente mencionó), mencionarlo brevemente y preguntá cómo evolucionó. "
+            f"Si el cliente arranca con una consulta nueva, contestá con la naturalidad de quien ya conoce su contexto, "
+            f"sin repetir información que ya se compartió. Tú decides si mencionar el tema previo o ir directo a "
+            f"responder la nueva consulta, según lo que sea más natural en este caso. "
+            f"Si en el historial NO hay nada concreto que retomar (cliente con solo 1-2 mensajes previos), "
+            f"saluda con calidez sin inventar temas, y dejá que el cliente lleve la conversación."
+        )
+    elif es_primer_contacto:
+        # Primer contacto real: el system_prompt del cliente ya tiene su saludo
+        # inicial. Le damos al LLM la hora del día como referencia natural.
         saludo = _saludo_por_hora()
-        contexto = f"Es la primera vez que este cliente escribe hoy. Es hora de {saludo.lower()}."
+        contexto = f"Es la primera vez que este cliente escribe. Es hora de {saludo.lower()}."
 
-    # Indicar profundidad de conversacion para calibrar largo de respuesta
+    # Indicar profundidad de conversacion para calibrar largo de respuesta.
+    # NO aplicar en retoma: ese hint dice "sin introducción" y contradice el
+    # hint de retoma que pide saludar con familiaridad. Una vez que el cliente
+    # responde al mensaje de retoma, el siguiente turno cae en "continua" y la
+    # profundidad aplica normal.
     turnos = len([m for m in historial if m["role"] == "user"])
-    if turnos >= 3:
+    if turnos >= 3 and not es_retoma:
         profundidad = f"Ya llevan {turnos} intercambios. Responde solo lo que se pregunta, sin introduccion."
         contexto = f"{contexto}\n{profundidad}".strip() if contexto else profundidad
 
