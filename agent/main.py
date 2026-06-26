@@ -935,6 +935,19 @@ async def webhook_handler(request: Request):
                     )
                 continue
 
+            # Dedup contra replay WAHA: cuando el celular se sincroniza con
+            # WhatsApp Web (al abrir la app), WAHA puede reemitir mensajes que
+            # el agente ya procesó. Si el mensaje_id ya está en la DB, skip.
+            # Este guard sumado al gate de timestamp del parser cubre el grueso
+            # de replays. Si el mensaje no tiene id (raro), procesamos normal.
+            _mid_entrante = getattr(msg, "mensaje_id", None)
+            if _mid_entrante and await existe_mensaje_id(msg.telefono, _mid_entrante):
+                logger.info(
+                    f"Skip duplicado (replay WAHA): mensaje_id={_mid_entrante} "
+                    f"chat={msg.telefono}"
+                )
+                continue
+
             # Checkpoint manual mode: persistir entrante + skip LLM/respuesta
             # IMPORTANTE: NO marcar leido (tick azul) cuando el agente esta en silencio.
             if await takeover.is_chat_in_manual_mode(msg.telefono):

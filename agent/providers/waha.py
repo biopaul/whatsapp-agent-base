@@ -3,12 +3,20 @@
 
 import os
 import base64
+import time
 import logging
 import httpx
 from fastapi import Request
 from agent.providers.base import ProveedorWhatsApp, MensajeEntrante
 
 logger = logging.getLogger("agentkit")
+
+# Edad máxima permitida para un mensaje entrante (segundos). Eventos más viejos
+# se consideran replay de sincronización de WAHA con el celular (al abrir la app
+# móvil, WAHA reemite mensajes históricos al webhook) y se descartan en el
+# parser para que no lleguen al LLM ni disparen respuestas tardías.
+# Configurable por env var: WAHA_MAX_MESSAGE_AGE_SEC. Default 300 (5 min).
+WAHA_MAX_MESSAGE_AGE_SEC = int(os.getenv("WAHA_MAX_MESSAGE_AGE_SEC", "300"))
 
 
 def _asegurar_chat_id(telefono: str) -> str:
@@ -62,6 +70,25 @@ class ProveedorWAHA(ProveedorWhatsApp):
         es_propio = payload.get("fromMe", False)
         mensaje_id = payload.get("id", "")
         source = (payload.get("source") or "").lower()  # "app" | "api" | ""
+
+        # Gate por timestamp del payload — descarta replays de WAHA.
+        # Cuando el celular se sincroniza con WhatsApp Web (al abrir la app),
+        # WAHA puede reemitir mensajes históricos al webhook. Si el timestamp
+        # del payload supera WAHA_MAX_MESSAGE_AGE_SEC, asumimos replay y skip.
+        # Backward compat: si el payload no trae timestamp, procesamos normal.
+        ts_raw = payload.get("timestamp")
+        if ts_raw is not None and WAHA_MAX_MESSAGE_AGE_SEC > 0:
+            try:
+                ts = float(ts_raw)
+                edad = time.time() - ts
+                if edad > WAHA_MAX_MESSAGE_AGE_SEC:
+                    logger.info(
+                        f"WAHA skip mensaje viejo (replay): ts_age={int(edad)}s "
+                        f"id={mensaje_id} fromMe={es_propio} source={source!r}"
+                    )
+                    return []
+            except (TypeError, ValueError):
+                pass  # timestamp inválido — seguimos sin gate
 
         # Resolver chat_id: para mensajes salientes (fromMe) el remitente "from" es
         # el numero del agente, no el del cliente. WAHA expone chatId con el destino;
