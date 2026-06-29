@@ -204,7 +204,13 @@ def _es_consulta_compleja(mensaje: str, historial: list[dict]) -> bool:
     return score >= 2
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra: str = "", telefono: str = "") -> str:
+async def generar_respuesta(
+    mensaje: str,
+    historial: list[dict],
+    contexto_extra: str = "",
+    telefono: str = "",
+    media_blocks: list[dict] | None = None,
+) -> str:
     """
     Genera respuesta del LLM. Si hay conectores activos, soporta tool use loop.
     Backward compat: sin conectores, hace una sola llamada al LLM como antes.
@@ -214,6 +220,9 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
         historial: lista de [{role, content}] anteriores.
         contexto_extra: contexto adicional para esta respuesta puntual.
         telefono: telefono del cliente (para inyectar en tool calls + lookup contacto).
+        media_blocks: lista opcional de bloques multimodales (image_url / file).
+            Si se pasa, el último user turn se manda como lista de bloques en lugar
+            de string plano. Formato OpenAI/OpenRouter.
     """
     # Bloquear solo mensajes verdaderamente vacios. Emojis sueltos (len=1)
     # antes caian aqui y disparaban fallback_message sin llegar al LLM.
@@ -389,7 +398,14 @@ async def generar_respuesta(mensaje: str, historial: list[dict], contexto_extra:
     for m in historial:
         if m.get("content", "").strip() != "SILENCIO":
             mensajes.append({"role": m["role"], "content": m["content"]})
-    mensajes.append({"role": "user", "content": mensaje})
+    if media_blocks:
+        # Visión / PDF: ultimo user turn como lista de bloques multimodales
+        # [media..., texto]. El LLM ve la imagen/PDF + el texto en el mismo turn.
+        user_content: list[dict] = list(media_blocks)
+        user_content.append({"type": "text", "text": mensaje})
+        mensajes.append({"role": "user", "content": user_content})
+    else:
+        mensajes.append({"role": "user", "content": mensaje})
 
     # Tool use loop (max 5 iteraciones)
     for iteration in range(5):

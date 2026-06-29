@@ -114,14 +114,15 @@ class ProveedorWAHA(ProveedorWhatsApp):
         if es_propio and source == "api":
             return []
 
+        def _resolver_media_url() -> str:
+            mu = media.get("url", "")
+            if not mu:
+                return f"{self.base_url}/api/{self.session}/messages/{mensaje_id}/download"
+            import re
+            return re.sub(r'^https?://localhost(:\d+)?', self.base_url, mu)
+
         if has_media and mimetype.startswith("audio/") and not es_propio:
-            media_url = media.get("url", "")
-            if not media_url:
-                media_url = f"{self.base_url}/api/{self.session}/messages/{mensaje_id}/download"
-            else:
-                # WAHA reporta URLs con localhost — reescribir a la URL publica.
-                import re
-                media_url = re.sub(r'^https?://localhost(:\d+)?', self.base_url, media_url)
+            media_url = _resolver_media_url()
             logger.info(f"Audio detectado de {chat_id}: {mimetype} -> {media_url[:120]}")
             return [MensajeEntrante(
                 telefono=chat_id,
@@ -133,7 +134,41 @@ class ProveedorWAHA(ProveedorWhatsApp):
                 tiene_media=True,
             )]
 
-        # Mensajes de texto / media no-audio
+        # Imagenes (JPG/PNG/WebP/GIF) — vision para verificacion de comprobantes
+        if has_media and mimetype.startswith("image/") and not es_propio:
+            media_url = _resolver_media_url()
+            caption = payload.get("body", "") or payload.get("caption", "") or ""
+            logger.info(f"Imagen detectada de {chat_id}: {mimetype} -> {media_url[:120]}")
+            return [MensajeEntrante(
+                telefono=chat_id,
+                texto=caption,
+                mensaje_id=mensaje_id,
+                es_propio=es_propio,
+                image_url=media_url,
+                image_mimetype=mimetype,
+                source=source,
+                tiene_media=True,
+            )]
+
+        # Documentos PDF — vision para comprobantes en PDF
+        if has_media and mimetype == "application/pdf" and not es_propio:
+            media_url = _resolver_media_url()
+            caption = payload.get("body", "") or payload.get("caption", "") or ""
+            filename = media.get("filename", "") or ""
+            logger.info(f"PDF detectado de {chat_id}: {filename!r} -> {media_url[:120]}")
+            return [MensajeEntrante(
+                telefono=chat_id,
+                texto=caption,
+                mensaje_id=mensaje_id,
+                es_propio=es_propio,
+                document_url=media_url,
+                document_mimetype=mimetype,
+                document_filename=filename,
+                source=source,
+                tiene_media=True,
+            )]
+
+        # Mensajes de texto / media no-audio / media no-imagen / media no-PDF
         texto = payload.get("body", "") or ""
 
         # Mensajes fromMe: retornarlos si vienen de WhatsApp Web/app (source=app)

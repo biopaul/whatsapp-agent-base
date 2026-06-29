@@ -99,3 +99,51 @@ async def touch_contact(
             )
     except Exception:
         pass
+
+
+async def mark_as_customer(
+    chat_id: str,
+    is_customer: bool = True,
+    source: Optional[str] = None,
+) -> bool:
+    """
+    Marca a un contacto como cliente (o desmarca con is_customer=False).
+    Fire-and-forget — loguea pero no rompe el flujo.
+
+    Endpoint plugin: POST /wp-json/gowap/v1/contacts/{TOKEN}/customer
+    Body: {"chat_id", "is_customer", "source"}
+
+    Retorna True si HTTP 200, False en cualquier otro caso (incluye disabled).
+    """
+    global _token_invalid
+    if not _is_enabled():
+        return False
+    if not should_touch_chat_id(chat_id):
+        return False
+
+    payload: dict = {"chat_id": chat_id, "is_customer": bool(is_customer)}
+    if source:
+        payload["source"] = source
+
+    url = f"{CONTACTS_URL_BASE}/customer"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            r = await client.post(url, json=payload)
+    except Exception as e:
+        logger.warning(f"mark_as_customer: red error {type(e).__name__} - {e}")
+        return False
+
+    if r.status_code == 401:
+        logger.error("mark_as_customer: token invalido (401). Modulo deshabilitado hasta restart.")
+        _token_invalid = True
+        return False
+
+    if r.status_code >= 400:
+        logger.warning(f"mark_as_customer: HTTP {r.status_code} - {r.text[:200]}")
+        return False
+
+    logger.info(
+        f"mark_as_customer: chat={chat_id} is_customer={is_customer} "
+        f"source={source!r} → OK"
+    )
+    return True

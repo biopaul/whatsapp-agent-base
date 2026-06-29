@@ -27,6 +27,12 @@ class MensajeEntrante:
     # True si el mensaje fromMe trae media (imagen/video) sin texto; en ese caso
     # tambien activa takeover externo aunque texto este vacio.
     tiene_media: bool = False
+    # URL + mimetype para visión (imágenes JPG/PNG/WebP/GIF, documentos PDF)
+    image_url: str = ""
+    image_mimetype: str = ""
+    document_url: str = ""
+    document_mimetype: str = ""
+    document_filename: str = ""
 
 
 class ProveedorWhatsApp(ABC):

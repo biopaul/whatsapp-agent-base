@@ -26,6 +26,7 @@ from agent.knowledge_loader import get_public_docs
 from agent import usage_reporter, takeover, outbound, debouncer, labels
 from agent import tts_client, audio_converter, tts_voices, tts_text_cleaner
 from agent import contacts_webhook
+from agent import vision
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
 
@@ -675,6 +676,7 @@ async def _procesar_y_responder(
     mensaje_id: str | None,
     fue_audio: bool,
     message_count: int = 1,
+    media_blocks: list[dict] | None = None,
 ) -> None:
     """
     Bloque IA: prebloqueo, escalado, generacion Claude, envio multi-parte,
@@ -818,8 +820,38 @@ async def _procesar_y_responder(
             )
         contexto = f"{contexto}\n{nota_audio}".strip() if contexto else nota_audio
 
+    # Si llegaron imágenes/PDFs, decirle al LLM que el cliente envio adjunto
+    # y darle la convencion del marker para confirmar pago verificado.
+    if media_blocks:
+        nota_vision = (
+            "El cliente envió uno o más archivos adjuntos (imagen y/o PDF). "
+            "Mirá el contenido y respondé naturalmente.\n"
+            "IMPORTANTE: si en base al system prompt determinás que el adjunto "
+            "es un COMPROBANTE DE PAGO VÁLIDO (coincide alias/CBU, monto, etc. "
+            "con lo configurado), agregá la cadena [PAGO_VERIFICADO] al final "
+            "de tu respuesta. Esa cadena no se le muestra al cliente — el "
+            "sistema la usa para marcar al contacto como cliente automáticamente. "
+            "NO emitas el marker si tenés dudas o si no es un comprobante."
+        )
+        contexto = f"{contexto}\n{nota_vision}".strip() if contexto else nota_vision
+
     # Generar respuesta con Claude
-    respuesta = await generar_respuesta(texto, historial, contexto, telefono=chat_id)
+    respuesta = await generar_respuesta(
+        texto, historial, contexto, telefono=chat_id, media_blocks=media_blocks
+    )
+
+    # Detectar marker [PAGO_VERIFICADO] y limpiarlo del texto.
+    # Dispara mark_as_customer en el plugin (fire-and-forget).
+    respuesta, pago_verificado = vision.extract_pago_verificado(respuesta)
+    if pago_verificado:
+        if not respuesta:
+            respuesta = "Perfecto, confirmé tu pago. Seguimos."
+        asyncio.create_task(contacts_webhook.mark_as_customer(
+            chat_id=chat_id,
+            is_customer=True,
+            source="payment_receipt_image",
+        ))
+        logger.info(f"PAGO_VERIFICADO para {chat_id} → mark_as_customer disparado")
 
     # Si Claude indica silencio, guardar en DB y no enviar
     if respuesta.strip() == "SILENCIO":
@@ -983,6 +1015,27 @@ async def webhook_handler(request: Request):
                 logger.info(f"Imagen recibida de {msg.telefono} pero image_receive deshabilitado")
                 continue
 
+            # Vision: descargar imagen/PDF y armar bloque para LLM
+            media_blocks_msg: list[dict] = []
+            if getattr(msg, "image_url", None):
+                waha_key = os.getenv("WAHA_API_KEY", "")
+                img_bytes = await vision.descargar_media(msg.image_url, waha_key)
+                if img_bytes:
+                    block = vision.build_image_block(img_bytes, msg.image_mimetype)
+                    if block:
+                        media_blocks_msg.append(block)
+                        if not msg.texto:
+                            msg.texto = "[imagen adjunta]"
+            if getattr(msg, "document_url", None) and msg.document_mimetype == "application/pdf":
+                waha_key = os.getenv("WAHA_API_KEY", "")
+                pdf_bytes = await vision.descargar_media(msg.document_url, waha_key)
+                if pdf_bytes:
+                    block = vision.build_pdf_block(pdf_bytes, msg.document_filename)
+                    if block:
+                        media_blocks_msg.append(block)
+                        if not msg.texto:
+                            msg.texto = f"[PDF adjunto: {msg.document_filename or 'archivo.pdf'}]"
+
             # Transcribir audio si es nota de voz
             fue_audio = bool(msg.audio_url)
             if msg.audio_url and not msg.texto:
@@ -1029,6 +1082,7 @@ async def webhook_handler(request: Request):
                 getattr(msg, "mensaje_id", None),
                 fue_audio,
                 _procesar_y_responder,
+                media_blocks=media_blocks_msg or None,
             )
 
         return {"status": "ok"}

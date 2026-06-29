@@ -38,6 +38,7 @@ def schedule(
     mensaje_id: str | None,
     fue_audio: bool,
     handler: Callable[..., Awaitable[None]],
+    media_blocks: list[dict] | None = None,
 ) -> None:
     """
     Encola un mensaje para respuesta debouncada. Si ya habia una task pendiente
@@ -46,12 +47,14 @@ def schedule(
     handler debe ser una coroutine con firma:
         async def handler(chat_id: str, texto_combinado: str,
                           mensaje_id: str | None, fue_audio: bool,
-                          message_count: int) -> None
+                          message_count: int,
+                          media_blocks: list[dict] | None = None) -> None
     """
     _pending_messages.setdefault(chat_id, []).append({
         "texto": texto,
         "mensaje_id": mensaje_id,
         "fue_audio": fue_audio,
+        "media_blocks": media_blocks or [],
     })
     prev = _pending_tasks.get(chat_id)
     if prev and not prev.done():
@@ -84,15 +87,29 @@ async def _flush(chat_id: str, handler: Callable[..., Awaitable[None]]) -> None:
     last = msgs[-1]
     # fue_audio es True si CUALQUIERA de los mensajes lo fue (decide presencia "grabando")
     any_audio = any(m.get("fue_audio", False) for m in msgs)
+    # Concatenar todos los media_blocks de la rafaga (imagenes/PDFs)
+    combined_media: list[dict] = []
+    for m in msgs:
+        combined_media.extend(m.get("media_blocks") or [])
 
     try:
-        await handler(
-            chat_id,
-            combined,
-            last["mensaje_id"],
-            any_audio,
-            len(msgs),
-        )
+        if combined_media:
+            await handler(
+                chat_id,
+                combined,
+                last["mensaje_id"],
+                any_audio,
+                len(msgs),
+                media_blocks=combined_media,
+            )
+        else:
+            await handler(
+                chat_id,
+                combined,
+                last["mensaje_id"],
+                any_audio,
+                len(msgs),
+            )
     except Exception as e:
         logger.error(f"Debounce flush error para {chat_id}: {e}")
 
