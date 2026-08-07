@@ -19,7 +19,7 @@ from agent.brain import generar_respuesta
 from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp, existe_mensaje_id
 from agent import brain
 from agent.providers import obtener_proveedor
-from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config, is_solo_mode
+from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config, is_solo_mode, get_ai_models
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
@@ -165,6 +165,26 @@ def _respuesta_version() -> str:
         return f"Ultima actualizacion: {fecha} a las {hora}."
     except Exception:
         return f"Ultima actualizacion: {raw}."
+
+
+def _respuesta_models() -> str:
+    """
+    Respuesta al comando /models.
+    Muestra los modelos IA configurados por tier (quick / full) y el orden de
+    fallback en cadena que usa el router.
+    """
+    cfg = get_ai_models()
+    quick = cfg.get("quick") or []
+    full = cfg.get("full") or []
+    quick_str = ", ".join(quick) if quick else "(no configurado)"
+    full_str = ", ".join(full) if full else "(no configurado)"
+    return (
+        "🤖 Modelos IA configurados:\n\n"
+        f"Rapido (mensajes simples): {quick_str}\n\n"
+        f"Completo (mensajes complejos): {full_str}\n\n"
+        "Routing: fallback en cadena — se prueba el primer modelo, "
+        "si falla se cae al siguiente."
+    )
 
 
 async def _es_nueva_sesion(telefono: str) -> bool:
@@ -1064,6 +1084,11 @@ async def webhook_handler(request: Request):
             # Comando /testaudio — fuerza audio de prueba (bypassa gate fue_audio)
             if msg.texto.strip().lower() == "/testaudio":
                 await _handle_testaudio_command(msg.telefono)
+                continue
+
+            # Comando /models — lista modelos IA configurados (diagnostico)
+            if msg.texto.strip().lower() == "/models":
+                await send_user_message(msg.telefono, _respuesta_models())
                 continue
 
             # Reaccion contextual al mensaje (feedback inmediato antes del debounce)
