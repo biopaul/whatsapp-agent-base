@@ -8,7 +8,7 @@ import logging
 import os
 import httpx
 
-from agent.memory import guardar_contacto
+from agent.memory import guardar_contacto, guardar_ficha_desde_tool
 
 logger = logging.getLogger("agentkit")
 
@@ -51,6 +51,9 @@ async def execute_tool(tool_call, telefono: str) -> dict:
         email = str(args.get("email", "") or "")
         if not nombre and not email:
             return {"ok": False, "message": "ningun campo para guardar"}
+        # Escribir en Ficha (fuente unificada) + tabla legacy Contacto para
+        # backward compat en tests / rutinas viejas que aun lean Contacto.
+        await guardar_ficha_desde_tool(telefono, nombre=nombre, email=email)
         await guardar_contacto(telefono, nombre=nombre, email=email)
         return {"ok": True, "message": "contacto guardado"}
 

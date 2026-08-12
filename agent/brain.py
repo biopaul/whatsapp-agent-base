@@ -18,7 +18,8 @@ from agent.config_loader import get_ai_models, get_system_prompt, get_fallback_m
 from agent.knowledge_loader import get_knowledge_text, get_public_docs
 from agent.connectors.registry import get_tools_for_connector, build_connectors_context
 from agent.connectors.executor import execute_tool
-from agent.memory import obtener_contacto
+from agent.memory import obtener_contacto, obtener_ficha
+from agent import ficha as ficha_module
 from agent import takeover
 from agent import guided_templates, guided_dispatcher
 
@@ -315,12 +316,19 @@ async def generar_respuesta(
 
     if telefono:
         try:
-            contacto = await obtener_contacto(telefono)
-            contact_ctx = _build_contact_context(contacto)
-            if contact_ctx:
-                dynamic_parts.append(contact_ctx)
+            ficha_row = await obtener_ficha(telefono)
+            ficha_ctx = ficha_module.build_ficha_context(ficha_row)
+            if ficha_ctx:
+                dynamic_parts.append(ficha_ctx)
+            elif ficha_row is None:
+                # Sin ficha (cliente pre-migration o LLM aun no la genero):
+                # fallback a Contacto legacy para no perder nombre/email.
+                contacto = await obtener_contacto(telefono)
+                contact_ctx = _build_contact_context(contacto)
+                if contact_ctx:
+                    dynamic_parts.append(contact_ctx)
         except Exception as e:
-            logger.warning(f"No se pudo obtener contacto: {e}")
+            logger.warning(f"No se pudo obtener ficha/contacto: {e}")
 
         # Awareness de cliente convertido: si el plugin marco al contacto como cliente,
         # cambia la filosofia del agente (soporte vs vendedor). Va en dynamic porque el

@@ -57,6 +57,29 @@ class Contacto(Base):
     actualizado_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Ficha(Base):
+    """
+    Ficha persistente del cliente. Subsume Contacto (nombre/email) y agrega
+    tags + resumen para dar continuidad conversacional cuando el cliente
+    vuelve tras mucho tiempo o fuera de la ventana de historial.
+
+    Se genera/actualiza automaticamente al detectar cierre de bloque
+    (>FICHA_CIERRE_BLOQUE_HORAS de silencio) y se inyecta al system prompt
+    del LLM en TODAS las conversaciones donde exista.
+    """
+    __tablename__ = "fichas"
+
+    telefono: Mapped[str] = mapped_column(String(50), primary_key=True)
+    nombre: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(190), nullable=True)
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    resumen: Mapped[str | None] = mapped_column(Text, nullable=True)
+    primer_contacto: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ultima_actualizacion: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    editado_manualmente: Mapped[bool] = mapped_column(Boolean, default=False)
+    editado_en: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class WahaSessionCapabilities(Base):
     """Cache de capabilities de WAHA por sesion (buttons/lists)."""
     __tablename__ = "waha_session_capabilities"
@@ -95,6 +118,39 @@ async def inicializar_db():
         except Exception:
             # Columna ya existe - ignorar (SQLite no soporta IF NOT EXISTS en ADD COLUMN)
             pass
+    # Backfill one-shot: copiar Contactos existentes a Fichas (solo si Fichas
+    # no tiene registro previo para ese telefono). Idempotente en re-arranques.
+    await _backfill_contactos_a_fichas()
+
+
+async def _backfill_contactos_a_fichas() -> None:
+    """Copia Contactos existentes a Fichas si no hay ficha ya creada."""
+    async with async_session() as session:
+        contactos = (await session.execute(select(Contacto))).scalars().all()
+        if not contactos:
+            return
+        fichas_existentes = {
+            row for row in
+            (await session.execute(select(Ficha.telefono))).scalars().all()
+        }
+        creadas = 0
+        for c in contactos:
+            if c.telefono in fichas_existentes:
+                continue
+            session.add(Ficha(
+                telefono=c.telefono,
+                nombre=(c.nombre or None) or None,
+                email=(c.email or None) or None,
+                tags=[],
+                resumen=None,
+                primer_contacto=c.primer_contacto,
+                ultima_actualizacion=c.actualizado_en or datetime.utcnow(),
+                editado_manualmente=False,
+                editado_en=None,
+            ))
+            creadas += 1
+        if creadas:
+            await session.commit()
 
 
 async def guardar_mensaje(telefono: str, role: str, content: str, mensaje_id: str | None = None):
@@ -311,3 +367,140 @@ async def actualizar_remote_dispatch_id(local_id: int, remote_id: int) -> None:
         if row is not None:
             row.remote_dispatch_id = remote_id
             await session.commit()
+
+
+# ------------------------------------------------------------------ Fichas ---
+
+async def obtener_ficha(telefono: str) -> Ficha | None:
+    """Retorna la Ficha por telefono o None si no existe."""
+    async with async_session() as session:
+        q = select(Ficha).where(Ficha.telefono == telefono)
+        return (await session.execute(q)).scalar_one_or_none()
+
+
+async def upsert_ficha_auto(
+    telefono: str,
+    nombre: str | None,
+    email: str | None,
+    tags: list[str],
+    resumen: str | None,
+) -> Ficha:
+    """
+    Upsert de ficha desde auto-refresh (LLM). Respeta editado_manualmente:
+    si la ficha existe y esta marcada como editada manualmente + el flag
+    global FICHA_AUTOUPDATE_RESPETA_MANUAL esta activo, NO sobreescribe.
+    Igual actualiza ultima_actualizacion para no re-generar en loop.
+    """
+    respeta_manual = os.getenv("FICHA_AUTOUPDATE_RESPETA_MANUAL", "true").lower() == "true"
+    ahora = datetime.utcnow()
+    async with async_session() as session:
+        q = select(Ficha).where(Ficha.telefono == telefono)
+        row = (await session.execute(q)).scalar_one_or_none()
+        if row is None:
+            row = Ficha(
+                telefono=telefono,
+                nombre=nombre,
+                email=email,
+                tags=tags or [],
+                resumen=resumen,
+                primer_contacto=ahora,
+                ultima_actualizacion=ahora,
+                editado_manualmente=False,
+                editado_en=None,
+            )
+            session.add(row)
+        else:
+            if not (respeta_manual and row.editado_manualmente):
+                row.nombre = nombre
+                row.email = email
+                row.tags = tags or []
+                row.resumen = resumen
+            row.ultima_actualizacion = ahora
+        await session.commit()
+        return row
+
+
+async def upsert_ficha_manual(
+    telefono: str,
+    campos: dict,
+) -> Ficha:
+    """
+    Actualiza campos de la ficha desde edicion manual (PUT endpoint).
+    Marca editado_manualmente=True, editado_en=now. Campos permitidos:
+    nombre, email, tags, resumen. Ignora los demas.
+    """
+    permitidos = {"nombre", "email", "tags", "resumen"}
+    ahora = datetime.utcnow()
+    async with async_session() as session:
+        q = select(Ficha).where(Ficha.telefono == telefono)
+        row = (await session.execute(q)).scalar_one_or_none()
+        if row is None:
+            row = Ficha(
+                telefono=telefono,
+                nombre=campos.get("nombre"),
+                email=campos.get("email"),
+                tags=campos.get("tags") or [],
+                resumen=campos.get("resumen"),
+                primer_contacto=ahora,
+                ultima_actualizacion=ahora,
+                editado_manualmente=True,
+                editado_en=ahora,
+            )
+            session.add(row)
+        else:
+            for k, v in campos.items():
+                if k in permitidos:
+                    setattr(row, k, v if k != "tags" else (v or []))
+            row.editado_manualmente = True
+            row.editado_en = ahora
+            row.ultima_actualizacion = ahora
+        await session.commit()
+        return row
+
+
+async def guardar_ficha_desde_tool(
+    telefono: str,
+    nombre: str = "",
+    email: str = "",
+) -> None:
+    """
+    Escritura desde el tool LLM `guardar_contacto`: actualiza SOLO los campos
+    provistos y no vacios, sin tocar tags/resumen. Preserva editado_manualmente.
+    """
+    ahora = datetime.utcnow()
+    async with async_session() as session:
+        q = select(Ficha).where(Ficha.telefono == telefono)
+        row = (await session.execute(q)).scalar_one_or_none()
+        if row is None:
+            row = Ficha(
+                telefono=telefono,
+                nombre=(nombre or None),
+                email=(email or None),
+                tags=[],
+                resumen=None,
+                primer_contacto=ahora,
+                ultima_actualizacion=ahora,
+            )
+            session.add(row)
+        else:
+            if nombre:
+                row.nombre = nombre
+            if email:
+                row.email = email
+            row.ultima_actualizacion = ahora
+        await session.commit()
+
+
+def ficha_to_dict(row: Ficha) -> dict:
+    """Serializa Ficha para responder REST (fechas ISO, defaults limpios)."""
+    return {
+        "telefono": row.telefono,
+        "nombre": row.nombre,
+        "email": row.email,
+        "tags": row.tags or [],
+        "resumen": row.resumen,
+        "primer_contacto": row.primer_contacto.isoformat() if row.primer_contacto else None,
+        "ultima_actualizacion": row.ultima_actualizacion.isoformat() if row.ultima_actualizacion else None,
+        "editado_manualmente": bool(row.editado_manualmente),
+        "editado_en": row.editado_en.isoformat() if row.editado_en else None,
+    }

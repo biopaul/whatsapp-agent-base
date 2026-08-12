@@ -27,6 +27,7 @@ from agent import usage_reporter, takeover, outbound, debouncer, labels
 from agent import tts_client, audio_converter, tts_voices, tts_text_cleaner
 from agent import contacts_webhook
 from agent import vision
+from agent import ficha
 from agent import guided_dispatcher, guided_selection, guided_actions, guided_templates
 from agent.memory import obtener_dispatch_activo
 
@@ -712,6 +713,14 @@ async def _procesar_y_responder(
     """
     caps = get_capabilities()
 
+    # Ficha: si el bloque anterior cerro (>FICHA_CIERRE_BLOQUE_HORAS de silencio),
+    # disparar recalculo en background (no bloquea la respuesta actual).
+    try:
+        if await ficha.detectar_cierre_bloque(chat_id):
+            asyncio.create_task(ficha.recalcular_ficha_background(chat_id))
+    except Exception as e:
+        logger.warning(f"ficha trigger fallo para {chat_id}: {e}")
+
     # Clasificar el estado de la conversación en 3 casos:
     #   - primer contacto  -> sin historial previo, el system_prompt del cliente
     #                         maneja el saludo inicial.
@@ -1158,3 +1167,66 @@ async def agent_notification(
         raise HTTPException(status_code=502, detail="provider failed")
 
     return {"status": "sent"}
+
+
+def _check_gowap_token(x_gowap_token: str) -> None:
+    """Auth helper: valida X-Gowap-Token contra el token del CONFIG_URL."""
+    config_url = os.getenv("CONFIG_URL", "")
+    expected_token = (config_url or "").rsplit("/config/", 1)[-1] if "/config/" in config_url else ""
+    if not expected_token or x_gowap_token != expected_token:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+
+@app.get("/ficha/{telefono}")
+async def ficha_get(
+    telefono: str,
+    x_gowap_token: str = Header(default=""),
+):
+    """Devuelve la ficha actual del cliente. 404 si no existe."""
+    _check_gowap_token(x_gowap_token)
+    from agent.memory import obtener_ficha as _obtener_ficha, ficha_to_dict as _to_dict
+    row = await _obtener_ficha(telefono)
+    if row is None:
+        raise HTTPException(status_code=404, detail="ficha no existe")
+    return _to_dict(row)
+
+
+@app.put("/ficha/{telefono}")
+async def ficha_put(
+    telefono: str,
+    request: Request,
+    x_gowap_token: str = Header(default=""),
+):
+    """
+    Actualiza campos de la ficha (nombre, email, tags, resumen).
+    Marca editado_manualmente=true. Crea la ficha si no existia.
+    """
+    _check_gowap_token(x_gowap_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body debe ser objeto")
+    from agent.memory import upsert_ficha_manual as _upsert_manual, ficha_to_dict as _to_dict
+    row = await _upsert_manual(telefono, body)
+    return _to_dict(row)
+
+
+@app.post("/ficha/{telefono}/recalcular")
+async def ficha_recalcular(
+    telefono: str,
+    x_gowap_token: str = Header(default=""),
+):
+    """
+    Fuerza la regeneracion sincronica de la ficha. Util para debug o para
+    refrescar tras edicion manual. Retorna la ficha nueva o 404 si no hay
+    historial suficiente.
+    """
+    _check_gowap_token(x_gowap_token)
+    await ficha.recalcular_ficha_background(telefono)
+    from agent.memory import obtener_ficha as _obtener_ficha, ficha_to_dict as _to_dict
+    row = await _obtener_ficha(telefono)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no se pudo generar ficha")
+    return _to_dict(row)
