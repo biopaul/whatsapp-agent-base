@@ -337,3 +337,164 @@ async def test_recalcular_background_no_rompe_si_llm_falla():
         await ficha_mod.recalcular_ficha_background("54911@c.us")  # no debe raise
     row = await memory.obtener_ficha("54911@c.us")
     assert row is None  # no se creo nada
+
+
+# ============================================================ Variantes chat_id
+
+@pytest.mark.asyncio
+async def test_variantes_matcheo_c_us_directo():
+    from agent import memory
+    await memory.guardar_mensaje("54911@c.us", "user", "hola")
+    msgs, matched = await memory.obtener_historial_variantes("54911@c.us")
+    assert len(msgs) == 1
+    assert matched == "54911@c.us"
+
+
+@pytest.mark.asyncio
+async def test_variantes_matcheo_s_whatsapp_net_fallback():
+    """Historial guardado con @s.whatsapp.net pero endpoint recibe @c.us."""
+    from agent import memory
+    await memory.guardar_mensaje("54911@s.whatsapp.net", "user", "hola")
+    msgs, matched = await memory.obtener_historial_variantes("54911@c.us")
+    assert len(msgs) == 1
+    assert matched == "54911@s.whatsapp.net"
+
+
+@pytest.mark.asyncio
+async def test_variantes_matcheo_sin_sufijo():
+    from agent import memory
+    await memory.guardar_mensaje("54911", "user", "hola")
+    msgs, matched = await memory.obtener_historial_variantes("54911@c.us")
+    assert len(msgs) == 1
+    assert matched == "54911"
+
+
+@pytest.mark.asyncio
+async def test_variantes_sin_matches_devuelve_vacio():
+    from agent import memory
+    msgs, matched = await memory.obtener_historial_variantes("54999@c.us")
+    assert msgs == []
+    assert matched is None
+
+
+@pytest.mark.asyncio
+async def test_variantes_incluye_timestamp():
+    """Los dicts devueltos deben incluir timestamp (crítico para delta merge)."""
+    from agent import memory
+    await memory.guardar_mensaje("54911@c.us", "user", "hola")
+    msgs, _ = await memory.obtener_historial_variantes("54911@c.us")
+    assert "timestamp" in msgs[0]
+    assert isinstance(msgs[0]["timestamp"], datetime)
+
+
+# ============================================================ force_full
+
+@pytest.mark.asyncio
+async def test_generar_ficha_force_full_ignora_ficha_previa():
+    """Con force_full=True, se usa prompt primera aunque haya ficha vigente."""
+    from agent import memory, ficha as ficha_mod
+    await memory.upsert_ficha_auto("54911@c.us", "Juan", None, ["lead_frio"], "resumen viejo")
+    historial = [{"role": "user", "content": "hola", "timestamp": datetime.utcnow()}]
+    with patch.object(ficha_mod, "_llamar_llm", new=AsyncMock(return_value={
+        "nombre": "Juan", "email": None, "tags": [], "resumen": "OK"
+    })) as m:
+        await ficha_mod.generar_ficha("54911@c.us", historial, force_full=True)
+    prompt_arg = m.await_args.args[0]
+    assert "HISTORIAL" in prompt_arg
+    assert "FICHA VIGENTE" not in prompt_arg  # no modo incremental
+
+
+# ============================================================ recalcular_ficha_sync
+
+@pytest.mark.asyncio
+async def test_recalcular_sync_ok():
+    from agent import memory, ficha as ficha_mod
+    await memory.guardar_mensaje("54911@c.us", "user", "Hola soy Juan")
+    with patch.object(ficha_mod, "_llamar_llm", new=AsyncMock(return_value={
+        "nombre": "Juan", "email": None, "tags": ["lead_frio"], "resumen": "OK"
+    })):
+        result = await ficha_mod.recalcular_ficha_sync("54911@c.us")
+    assert result["status"] == "ok"
+    assert result["ficha"].nombre == "Juan"
+    assert result["matched_variant"] == "54911@c.us"
+    assert "elapsed_ms" in result
+
+
+@pytest.mark.asyncio
+async def test_recalcular_sync_no_history():
+    from agent import ficha as ficha_mod
+    result = await ficha_mod.recalcular_ficha_sync("54999@c.us")
+    assert result["status"] == "no_history"
+    assert result["ficha"] is None
+    assert result["matched_variant"] is None
+
+
+@pytest.mark.asyncio
+async def test_recalcular_sync_llm_failed():
+    from agent import memory, ficha as ficha_mod
+    await memory.guardar_mensaje("54911@c.us", "user", "hola")
+    with patch.object(ficha_mod, "_llamar_llm", new=AsyncMock(return_value=None)):
+        result = await ficha_mod.recalcular_ficha_sync("54911@c.us")
+    assert result["status"] == "llm_failed"
+    assert result["ficha"] is None
+    assert result["matched_variant"] == "54911@c.us"
+    assert "reason" in result
+
+
+@pytest.mark.asyncio
+async def test_recalcular_sync_match_por_variante():
+    """Historial en @s.whatsapp.net pero endpoint recibe @c.us: debe matchear."""
+    from agent import memory, ficha as ficha_mod
+    await memory.guardar_mensaje("54911@s.whatsapp.net", "user", "hola")
+    with patch.object(ficha_mod, "_llamar_llm", new=AsyncMock(return_value={
+        "nombre": "Juan", "email": None, "tags": [], "resumen": "OK"
+    })):
+        result = await ficha_mod.recalcular_ficha_sync("54911@c.us")
+    assert result["status"] == "ok"
+    assert result["matched_variant"] == "54911@s.whatsapp.net"
+
+
+@pytest.mark.asyncio
+async def test_recalcular_sync_persist_failed():
+    from agent import memory, ficha as ficha_mod
+    await memory.guardar_mensaje("54911@c.us", "user", "hola")
+    with patch.object(ficha_mod, "_llamar_llm", new=AsyncMock(return_value={
+        "nombre": "Juan", "email": None, "tags": [], "resumen": "OK"
+    })), patch.object(ficha_mod, "upsert_ficha_auto", new=AsyncMock(side_effect=RuntimeError("db down"))):
+        result = await ficha_mod.recalcular_ficha_sync("54911@c.us")
+    assert result["status"] == "persist_failed"
+    assert "db down" in result["reason"]
+
+
+# ============================================================ debug_snapshot
+
+@pytest.mark.asyncio
+async def test_debug_snapshot_chat_vacio():
+    from agent import ficha as ficha_mod
+    snap = await ficha_mod.debug_snapshot("54999@c.us")
+    assert snap["historial_count"] == 0
+    assert snap["matched_variant"] is None
+    assert snap["ficha_previa_exists"] is False
+    assert snap["ficha_editado_manualmente"] is False
+
+
+@pytest.mark.asyncio
+async def test_debug_snapshot_con_historial_y_ficha():
+    from agent import memory, ficha as ficha_mod
+    await memory.guardar_mensaje("54911@c.us", "user", "hola")
+    await memory.upsert_ficha_manual("54911@c.us", {"nombre": "Juan"})
+    snap = await ficha_mod.debug_snapshot("54911@c.us")
+    assert snap["historial_count"] == 1
+    assert snap["matched_variant"] == "54911@c.us"
+    assert snap["ficha_previa_exists"] is True
+    assert snap["ficha_editado_manualmente"] is True
+    assert snap["ultimo_msg_ts"] is not None
+
+
+@pytest.mark.asyncio
+async def test_debug_snapshot_match_por_variante():
+    from agent import memory, ficha as ficha_mod
+    await memory.guardar_mensaje("54911@s.whatsapp.net", "user", "hola")
+    snap = await ficha_mod.debug_snapshot("54911@c.us")
+    assert snap["historial_count"] == 1
+    assert snap["matched_variant"] == "54911@s.whatsapp.net"

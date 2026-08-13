@@ -1219,14 +1219,49 @@ async def ficha_recalcular(
     x_gowap_token: str = Header(default=""),
 ):
     """
-    Fuerza la regeneracion sincronica de la ficha. Util para debug o para
-    refrescar tras edicion manual. Retorna la ficha nueva o 404 si no hay
-    historial suficiente.
+    Fuerza la regeneracion sincronica de la ficha usando modo full (todo
+    el historial, ignorando ficha previa). Distingue causas de fallo:
+
+      200 OK              → ficha generada y persistida
+      404 no_history      → cero mensajes para este telefono (chat_id mismatch
+                            o chat verdaderamente vacio). Usar /debug para diagnosticar.
+      502 llm_failed      → historial encontrado pero el LLM fallo o retorno JSON invalido
+      500 persist_failed  → LLM OK pero la escritura a DB fallo
     """
     _check_gowap_token(x_gowap_token)
-    await ficha.recalcular_ficha_background(telefono)
-    from agent.memory import obtener_ficha as _obtener_ficha, ficha_to_dict as _to_dict
-    row = await _obtener_ficha(telefono)
-    if row is None:
-        raise HTTPException(status_code=404, detail="no se pudo generar ficha")
-    return _to_dict(row)
+    result = await ficha.recalcular_ficha_sync(telefono, force_full=True)
+    status = result["status"]
+    if status == "ok":
+        from agent.memory import ficha_to_dict as _to_dict
+        payload = _to_dict(result["ficha"])
+        payload["_matched_variant"] = result.get("matched_variant")
+        payload["_elapsed_ms"] = result.get("elapsed_ms")
+        return payload
+    if status == "no_history":
+        raise HTTPException(status_code=404, detail="no_history")
+    if status == "llm_failed":
+        raise HTTPException(status_code=502, detail={
+            "error": "llm_failed",
+            "reason": result.get("reason"),
+            "matched_variant": result.get("matched_variant"),
+        })
+    if status == "persist_failed":
+        raise HTTPException(status_code=500, detail={
+            "error": "persist_failed",
+            "reason": result.get("reason"),
+        })
+    raise HTTPException(status_code=500, detail=f"unknown_status:{status}")
+
+
+@app.get("/ficha/{telefono}/debug")
+async def ficha_debug(
+    telefono: str,
+    x_gowap_token: str = Header(default=""),
+):
+    """
+    Snapshot del estado interno para diagnosticar por que /recalcular puede
+    fallar. NO llama al LLM ni modifica nada. Devuelve historial_count,
+    matched_variant, ficha_previa_exists, etc.
+    """
+    _check_gowap_token(x_gowap_token)
+    return await ficha.debug_snapshot(telefono)

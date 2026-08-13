@@ -197,6 +197,53 @@ async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
         ]
 
 
+def _telefono_variantes(telefono: str) -> list[str]:
+    """
+    Genera variantes del identificador para tolerar formatos historicos:
+    - "X@c.us" | "X@s.whatsapp.net" | "X" (sin sufijo).
+    Preserva el input original como primera variante para priorizar match exacto.
+    """
+    if not telefono:
+        return []
+    variantes = [telefono]
+    numero = telefono.split("@", 1)[0]
+    for suf in ("@c.us", "@s.whatsapp.net", ""):
+        cand = f"{numero}{suf}" if suf else numero
+        if cand and cand not in variantes:
+            variantes.append(cand)
+    return variantes
+
+
+async def obtener_historial_variantes(
+    telefono: str, limite: int = 200
+) -> tuple[list[dict], str | None]:
+    """
+    Igual que obtener_historial pero prueba variantes del telefono si el
+    match exacto retorna vacio (chat_id mismatch @c.us vs @s.whatsapp.net).
+    Retorna (mensajes_dict, variante_matcheada) o ([], None) si nada matchea.
+
+    Los dicts incluyen timestamp para permitir merge incremental.
+    """
+    for variante in _telefono_variantes(telefono):
+        async with async_session() as session:
+            q = (
+                select(Mensaje)
+                .where(Mensaje.telefono == variante)
+                .order_by(Mensaje.timestamp.desc())
+                .limit(limite)
+            )
+            result = await session.execute(q)
+            filas = result.scalars().all()
+        if filas:
+            filas.reverse()
+            data = [
+                {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+                for m in filas
+            ]
+            return data, variante
+    return [], None
+
+
 async def obtener_ultimo_timestamp(telefono: str) -> datetime | None:
     """Retorna el timestamp del último mensaje de una conversación, o None si no hay."""
     async with async_session() as session:

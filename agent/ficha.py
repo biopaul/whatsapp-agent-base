@@ -28,6 +28,7 @@ from agent.memory import (
     Ficha,
     obtener_ficha,
     obtener_historial,
+    obtener_historial_variantes,
     obtener_ultimo_timestamp,
     upsert_ficha_auto,
 )
@@ -264,15 +265,19 @@ async def _llamar_llm(prompt: str) -> Optional[dict]:
     return _sanitize_ficha_dict(parsed)
 
 
-async def generar_ficha(telefono: str, historial: list[dict]) -> Optional[dict]:
+async def generar_ficha(
+    telefono: str,
+    historial: list[dict],
+    force_full: bool = False,
+) -> Optional[dict]:
     """
     Genera (o actualiza incrementalmente) la ficha para este telefono.
     Retorna dict {nombre, email, tags, resumen} o None si el LLM falla.
 
-    Si ya existe ficha vigente: modo incremental, pasa ficha + delta desde
-    ultima_actualizacion. Si es primera vez: modo full con todo el historial.
+    Si ya existe ficha vigente y force_full=False: modo incremental (delta).
+    Si force_full=True o no hay ficha previa: modo full con todo el historial.
     """
-    ficha_previa = await obtener_ficha(telefono)
+    ficha_previa = None if force_full else await obtener_ficha(telefono)
     if ficha_previa is None:
         historial_recortado = historial[-FICHA_HISTORIAL_MAX_MENSAJES:]
         historial_fmt = _format_historial(historial_recortado)
@@ -307,25 +312,114 @@ def _msg_ts_after(msg: dict, cutoff: datetime) -> bool:
 async def recalcular_ficha_background(telefono: str) -> None:
     """
     Fire-and-forget: dispara generacion + persistencia. Nunca levanta.
-    Respeta editado_manualmente via upsert_ficha_auto.
+    Respeta editado_manualmente via upsert_ficha_auto. Usa modo incremental
+    si hay ficha previa (comportamiento pre-1.11.1).
     """
     try:
-        historial = await obtener_historial(telefono, limite=FICHA_HISTORIAL_MAX_MENSAJES)
-        if not historial:
-            return
-        data = await generar_ficha(telefono, historial)
-        if data is None:
-            return
-        await upsert_ficha_auto(
+        await recalcular_ficha_sync(telefono, force_full=False)
+    except Exception as e:
+        logger.warning(f"ficha: recalculo background fallo para {telefono}: {e}")
+
+
+async def recalcular_ficha_sync(
+    telefono: str,
+    force_full: bool = True,
+) -> dict:
+    """
+    Recalcula la ficha de forma sincronica. Retorna un dict estructurado
+    con status para que los callers (endpoint REST) puedan diferenciar
+    casos y devolver codigos HTTP apropiados.
+
+    force_full=True es el default para /recalcular: fuerza modo full
+    aunque haya ficha previa (semantica del endpoint: "forza siempre").
+
+    Retorno:
+      {"status": "ok", "ficha": <Ficha>, "matched_variant": <str>, "elapsed_ms": int}
+      {"status": "no_history", "ficha": None, "matched_variant": None}
+      {"status": "llm_failed", "ficha": None, "matched_variant": <str>, "reason": <str>}
+      {"status": "persist_failed", "ficha": None, "matched_variant": <str>, "reason": <str>}
+    """
+    import time
+    t0 = time.time()
+    historial, matched = await obtener_historial_variantes(
+        telefono, limite=FICHA_HISTORIAL_MAX_MENSAJES
+    )
+    ficha_previa = await obtener_ficha(telefono)
+    logger.info(
+        f"ficha.recalcular: telefono={telefono!r} historial_count={len(historial)} "
+        f"matched_variant={matched!r} ficha_previa={ficha_previa is not None} "
+        f"force_full={force_full} model={_model_para_ficha()}"
+    )
+    if not historial:
+        return {"status": "no_history", "ficha": None, "matched_variant": None}
+    data = await generar_ficha(telefono, historial, force_full=force_full)
+    if data is None:
+        logger.warning(f"ficha.recalcular: LLM devolvio None para {telefono}")
+        return {
+            "status": "llm_failed",
+            "ficha": None,
+            "matched_variant": matched,
+            "reason": "LLM sin respuesta valida o historial sin sustancia",
+        }
+    try:
+        row = await upsert_ficha_auto(
             telefono=telefono,
             nombre=data["nombre"],
             email=data["email"],
             tags=data["tags"],
             resumen=data["resumen"],
         )
-        logger.info(f"ficha: recalculada para {telefono} (tags={data['tags']})")
     except Exception as e:
-        logger.warning(f"ficha: recalculo background fallo para {telefono}: {e}")
+        logger.error(f"ficha.recalcular: persist fallo para {telefono}: {e}")
+        return {
+            "status": "persist_failed",
+            "ficha": None,
+            "matched_variant": matched,
+            "reason": f"{type(e).__name__}: {e}",
+        }
+    elapsed_ms = int((time.time() - t0) * 1000)
+    logger.info(
+        f"ficha.recalcular: OK telefono={telefono!r} tags={data['tags']} "
+        f"elapsed_ms={elapsed_ms}"
+    )
+    return {
+        "status": "ok",
+        "ficha": row,
+        "matched_variant": matched,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+async def debug_snapshot(telefono: str) -> dict:
+    """
+    Snapshot del estado para /ficha/{telefono}/debug (sin llamar al LLM).
+    Retorna metadata para diagnostico de 404/500 en /recalcular.
+    """
+    historial, matched = await obtener_historial_variantes(
+        telefono, limite=FICHA_HISTORIAL_MAX_MENSAJES
+    )
+    ficha_previa = await obtener_ficha(telefono)
+    ultimo_ts = None
+    if historial:
+        last = historial[-1].get("timestamp")
+        if isinstance(last, datetime):
+            ultimo_ts = last.isoformat()
+    delta_count = 0
+    if ficha_previa and historial:
+        cutoff = ficha_previa.ultima_actualizacion
+        delta_count = sum(1 for m in historial if _msg_ts_after(m, cutoff))
+    return {
+        "telefono": telefono,
+        "matched_variant": matched,
+        "historial_count": len(historial),
+        "ultimo_msg_ts": ultimo_ts,
+        "ficha_previa_exists": ficha_previa is not None,
+        "ficha_editado_manualmente": bool(ficha_previa.editado_manualmente) if ficha_previa else False,
+        "ficha_ultima_actualizacion": ficha_previa.ultima_actualizacion.isoformat() if ficha_previa and ficha_previa.ultima_actualizacion else None,
+        "delta_incremental_seria": delta_count,
+        "model": _model_para_ficha(),
+        "cierre_bloque_horas": FICHA_CIERRE_BLOQUE_HORAS,
+    }
 
 
 # ------------------------------------------------------ Injection al prompt ---
