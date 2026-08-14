@@ -26,6 +26,18 @@ def _asegurar_chat_id(telefono: str) -> str:
     return f"{telefono}@c.us"
 
 
+def _es_chat_broadcast(chat_id: str) -> bool:
+    """True si el chatId apunta a status/broadcast (no un chat 1-a-1).
+
+    Enviar a "status@broadcast" via /api/sendText publica el contenido como
+    una Historia (Estado) en la cuenta del cliente — fuga pública de mensajes
+    privados. Todos los métodos de envío deben rechazar estos chatIds.
+    """
+    if not chat_id:
+        return False
+    return chat_id == "status@broadcast" or chat_id.endswith("@broadcast")
+
+
 def _extract_msg_id(response) -> str | None:
     """Extrae el id del mensaje del response WAHA (soporta {'id': str} o {'id': {'_serialized': str}})."""
     try:
@@ -100,6 +112,17 @@ class ProveedorWAHA(ProveedorWhatsApp):
             or payload.get("from", "")
         )
         chat_id = (raw_chat or "").replace("@s.whatsapp.net", "@c.us")
+
+        # Descartar eventos de Historias/Estados (status@broadcast) y broadcast
+        # lists. Si respondiéramos a un chatId "@broadcast" via sendText, WAHA
+        # publicaría el mensaje como Historia en la cuenta del cliente —
+        # fuga pública de mensajes privados.
+        if _es_chat_broadcast(chat_id):
+            logger.info(
+                f"WAHA skip evento broadcast/status: chat_id={chat_id!r} "
+                f"id={mensaje_id} fromMe={es_propio} source={source!r}"
+            )
+            return []
 
         # Audio / nota de voz — detectar por hasMedia + mimetype
         has_media = bool(payload.get("hasMedia", False))
@@ -207,6 +230,9 @@ class ProveedorWAHA(ProveedorWhatsApp):
             logger.warning("WAHA_BASE_URL no configurado — mensaje no enviado")
             return False
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            logger.error(f"WAHA sendText BLOQUEADO — chatId broadcast/status: {chat_id!r}")
+            return False
         async with httpx.AsyncClient() as client:
             try:
                 r = await client.post(
@@ -232,6 +258,9 @@ class ProveedorWAHA(ProveedorWhatsApp):
             logger.warning("WAHA_BASE_URL no configurado — mensaje no enviado")
             return None
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            logger.error(f"WAHA sendText BLOQUEADO — chatId broadcast/status: {chat_id!r}")
+            return None
         async with httpx.AsyncClient() as client:
             try:
                 r = await client.post(
@@ -270,6 +299,8 @@ class ProveedorWAHA(ProveedorWhatsApp):
     async def _set_presence(self, telefono: str, presence: str) -> None:
         """Envia un estado de presencia al chat."""
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            return
         async with httpx.AsyncClient() as client:
             try:
                 r = await client.post(
@@ -291,6 +322,8 @@ class ProveedorWAHA(ProveedorWhatsApp):
     async def marcar_leido(self, telefono: str) -> None:
         """Marca mensajes del chat como leidos (ticks azules)."""
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            return
         async with httpx.AsyncClient() as client:
             try:
                 r = await client.post(
@@ -306,6 +339,9 @@ class ProveedorWAHA(ProveedorWhatsApp):
     async def enviar_archivo(self, telefono: str, url: str, filename: str, caption: str = "") -> bool:
         """Envia un archivo al cliente via WAHA POST /api/sendFile."""
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            logger.error(f"WAHA sendFile BLOQUEADO — chatId broadcast/status: {chat_id!r}")
+            return False
         payload: dict = {
             "session": self.session,
             "chatId": chat_id,
@@ -333,6 +369,8 @@ class ProveedorWAHA(ProveedorWhatsApp):
     async def reaccionar(self, telefono: str, mensaje_id: str, emoji: str) -> None:
         """Envia una reaccion emoji a un mensaje."""
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            return
         async with httpx.AsyncClient() as client:
             try:
                 r = await client.post(
@@ -361,6 +399,9 @@ class ProveedorWAHA(ProveedorWhatsApp):
         if not self.base_url:
             return (False, None, None)
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            logger.error(f"WAHA sendButtons BLOQUEADO — chatId broadcast/status: {chat_id!r}")
+            return (False, None, None)
         payload: dict = {
             "session": self.session,
             "chatId": chat_id,
@@ -401,6 +442,9 @@ class ProveedorWAHA(ProveedorWhatsApp):
         if not self.base_url:
             return (False, None, None)
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            logger.error(f"WAHA sendList BLOQUEADO — chatId broadcast/status: {chat_id!r}")
+            return (False, None, None)
         payload: dict = {
             "session": self.session,
             "chatId": chat_id,
@@ -440,6 +484,9 @@ class ProveedorWAHA(ProveedorWhatsApp):
         if not self.base_url:
             return None
         chat_id = _asegurar_chat_id(telefono)
+        if _es_chat_broadcast(chat_id):
+            logger.error(f"WAHA sendVoice BLOQUEADO — chatId broadcast/status: {chat_id!r}")
+            return None
         payload = {
             "session": self.session,
             "chatId": chat_id,
