@@ -713,13 +713,9 @@ async def _procesar_y_responder(
     """
     caps = get_capabilities()
 
-    # Ficha: si el bloque anterior cerro (>FICHA_CIERRE_BLOQUE_HORAS de silencio),
-    # disparar recalculo en background (no bloquea la respuesta actual).
-    try:
-        if await ficha.detectar_cierre_bloque(chat_id):
-            asyncio.create_task(ficha.recalcular_ficha_background(chat_id))
-    except Exception as e:
-        logger.warning(f"ficha trigger fallo para {chat_id}: {e}")
+    # Nota 1.12.0: eliminamos el trigger de auto-recalculo de ficha via LLM.
+    # La ficha ahora es curada 100% por humanos desde el plugin WP (PUT /ficha).
+    # No hay costo LLM extra en background ni riesgo de alucinaciones.
 
     # Clasificar el estado de la conversación en 3 casos:
     #   - primer contacto  -> sin historial previo, el system_prompt del cliente
@@ -1219,38 +1215,30 @@ async def ficha_recalcular(
     x_gowap_token: str = Header(default=""),
 ):
     """
-    Fuerza la regeneracion sincronica de la ficha usando modo full (todo
-    el historial, ignorando ficha previa). Distingue causas de fallo:
-
-      200 OK              → ficha generada y persistida
-      404 no_history      → cero mensajes para este telefono (chat_id mismatch
-                            o chat verdaderamente vacio). Usar /debug para diagnosticar.
-      502 llm_failed      → historial encontrado pero el LLM fallo o retorno JSON invalido
-      500 persist_failed  → LLM OK pero la escritura a DB fallo
+    DEPRECATED en 1.12.0. La generacion automatica via LLM se elimino;
+    la ficha ahora es curada por humanos desde el plugin WP via PUT /ficha.
+    Este endpoint devuelve 410 Gone permanentemente para forzar migracion
+    del plugin.
     """
     _check_gowap_token(x_gowap_token)
-    result = await ficha.recalcular_ficha_sync(telefono, force_full=True)
-    status = result["status"]
-    if status == "ok":
-        from agent.memory import ficha_to_dict as _to_dict
-        payload = _to_dict(result["ficha"])
-        payload["_matched_variant"] = result.get("matched_variant")
-        payload["_elapsed_ms"] = result.get("elapsed_ms")
-        return payload
-    if status == "no_history":
-        raise HTTPException(status_code=404, detail="no_history")
-    if status == "llm_failed":
-        raise HTTPException(status_code=502, detail={
-            "error": "llm_failed",
-            "reason": result.get("reason"),
-            "matched_variant": result.get("matched_variant"),
-        })
-    if status == "persist_failed":
-        raise HTTPException(status_code=500, detail={
-            "error": "persist_failed",
-            "reason": result.get("reason"),
-        })
-    raise HTTPException(status_code=500, detail=f"unknown_status:{status}")
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "endpoint deprecated en 1.12.0: la ficha ahora es solo edicion "
+            "manual. Usa PUT /ficha/{telefono} para actualizar."
+        ),
+    )
+
+
+@app.get("/ficha/tags/vocab")
+async def ficha_tags_vocab(x_gowap_token: str = Header(default="")):
+    """
+    Vocabulario sugerido de tags para que el plugin lo use como dropdown/
+    autocomplete al editar una ficha. NO es enforcement: PUT /ficha acepta
+    tags custom fuera de esta lista.
+    """
+    _check_gowap_token(x_gowap_token)
+    return {"tags": ficha.TAGS_VOCABULARIO_SUGERIDO}
 
 
 @app.get("/ficha/{telefono}/debug")
@@ -1259,9 +1247,9 @@ async def ficha_debug(
     x_gowap_token: str = Header(default=""),
 ):
     """
-    Snapshot del estado interno para diagnosticar por que /recalcular puede
-    fallar. NO llama al LLM ni modifica nada. Devuelve historial_count,
-    matched_variant, ficha_previa_exists, etc.
+    Snapshot del estado interno para diagnosticar visualmente que ve el
+    agente para este contacto. No modifica nada. Incluye el bloque exacto
+    que se inyectaria al system prompt.
     """
     _check_gowap_token(x_gowap_token)
     return await ficha.debug_snapshot(telefono)

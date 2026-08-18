@@ -35,13 +35,15 @@ client = AsyncOpenAI(
 # Maximo de tokens por respuesta.
 _MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
 
-# Kill switch temporal para la inyeccion de "Ficha del cliente" al system prompt.
-# Default false: reportes de respuestas erraticas atribuibles al resumen/tags
-# generados automaticamente que contradicen el historial reciente. El
-# auto-refresh en background sigue corriendo (los datos quedan frescos), solo
-# se corta la inyeccion. Reactivar con FICHA_INYECCION_ACTIVA=true en Railway
-# cuando la implementacion de la ficha reduzca el ruido.
-FICHA_INYECCION_ACTIVA = os.getenv("FICHA_INYECCION_ACTIVA", "false").lower() == "true"
+# FICHA_INYECCION_ACTIVA se elimino en 1.12.0: la ficha ahora es curada por
+# humanos (no LLM), por lo que ya no hay riesgo de alucinaciones y no se
+# necesita kill switch. La inyeccion es siempre activa si la ficha tiene datos.
+#
+# LOG_PROMPT_FINAL: flag de debug. Cuando true, loguea el prompt final
+# enviado al LLM (system + mensajes) truncado a 2KB. Nivel warning para que
+# salga en Railway aun con LOG_LEVEL=INFO. NO dejar activo en produccion
+# 24x7 (verboso + puede loguear datos del cliente).
+LOG_PROMPT_FINAL = os.getenv("LOG_PROMPT_FINAL", "false").lower() == "true"
 
 # Rango Unicode amplio de emojis para detectar mensajes formados solo por
 # pictografias. Incluye Emoticons, Symbols & Pictographs (con extensiones),
@@ -173,6 +175,24 @@ def _is_anthropic_model(model: str) -> bool:
 def _filter_tool_use_capable(models: list[str]) -> list[str]:
     """Retorna solo los modelos que soportan function calling."""
     return [m for m in models if any(m.startswith(p) for p in TOOL_USE_PREFIXES)]
+
+
+def _log_prompt_final(messages: list[dict], max_bytes: int = 2048) -> None:
+    """
+    Log del prompt final enviado al LLM (system + turns). Truncado a max_bytes.
+    Activar con LOG_PROMPT_FINAL=true. Level warning para que salga en Railway
+    aun con LOG_LEVEL=INFO. Herramienta de debug puntual — no dejar activo
+    en produccion 24x7 (verboso + puede loguear datos del cliente).
+    """
+    try:
+        import json as _json
+        raw = _json.dumps(messages, ensure_ascii=False, default=str)
+    except Exception as e:
+        logger.warning(f"LOG_PROMPT_FINAL: no se pudo serializar messages: {e}")
+        return
+    if len(raw) > max_bytes:
+        raw = raw[:max_bytes] + f"...[truncado, total={len(raw)}B]"
+    logger.warning(f"LOG_PROMPT_FINAL messages={raw}")
 
 
 def _build_contact_context(contacto) -> str:
@@ -324,17 +344,14 @@ async def generar_respuesta(
 
     if telefono:
         try:
-            ficha_agregada = False
-            if FICHA_INYECCION_ACTIVA:
-                ficha_row = await obtener_ficha(telefono)
-                ficha_ctx = ficha_module.build_ficha_context(ficha_row)
-                if ficha_ctx:
-                    dynamic_parts.append(ficha_ctx)
-                    ficha_agregada = True
-            if not ficha_agregada:
-                # Fallback a Contacto legacy (nombre/email) cuando:
-                # (a) FICHA_INYECCION_ACTIVA=false (kill switch temporal), o
-                # (b) todavia no hay ficha para este cliente.
+            # Ficha (curada por humanos, prima sobre historial si tiene datos).
+            # Si esta vacia, cae al fallback Contacto legacy (nombre/email
+            # aprendidos por el tool guardar_contacto del LLM).
+            ficha_row = await obtener_ficha(telefono)
+            ficha_ctx = ficha_module.build_ficha_context(ficha_row)
+            if ficha_ctx:
+                dynamic_parts.append(ficha_ctx)
+            else:
                 contacto = await obtener_contacto(telefono)
                 contact_ctx = _build_contact_context(contacto)
                 if contact_ctx:
@@ -439,6 +456,9 @@ async def generar_respuesta(
                 kwargs["tools"] = tools
             if len(models) > 1:
                 kwargs["extra_body"] = {"models": models, "route": "fallback"}
+
+            if LOG_PROMPT_FINAL and iteration == 0:
+                _log_prompt_final(kwargs.get("messages") or [])
 
             response = await client.chat.completions.create(**kwargs)
         except Exception as e:

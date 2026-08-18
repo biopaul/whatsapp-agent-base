@@ -425,48 +425,6 @@ async def obtener_ficha(telefono: str) -> Ficha | None:
         return (await session.execute(q)).scalar_one_or_none()
 
 
-async def upsert_ficha_auto(
-    telefono: str,
-    nombre: str | None,
-    email: str | None,
-    tags: list[str],
-    resumen: str | None,
-) -> Ficha:
-    """
-    Upsert de ficha desde auto-refresh (LLM). Respeta editado_manualmente:
-    si la ficha existe y esta marcada como editada manualmente + el flag
-    global FICHA_AUTOUPDATE_RESPETA_MANUAL esta activo, NO sobreescribe.
-    Igual actualiza ultima_actualizacion para no re-generar en loop.
-    """
-    respeta_manual = os.getenv("FICHA_AUTOUPDATE_RESPETA_MANUAL", "true").lower() == "true"
-    ahora = datetime.utcnow()
-    async with async_session() as session:
-        q = select(Ficha).where(Ficha.telefono == telefono)
-        row = (await session.execute(q)).scalar_one_or_none()
-        if row is None:
-            row = Ficha(
-                telefono=telefono,
-                nombre=nombre,
-                email=email,
-                tags=tags or [],
-                resumen=resumen,
-                primer_contacto=ahora,
-                ultima_actualizacion=ahora,
-                editado_manualmente=False,
-                editado_en=None,
-            )
-            session.add(row)
-        else:
-            if not (respeta_manual and row.editado_manualmente):
-                row.nombre = nombre
-                row.email = email
-                row.tags = tags or []
-                row.resumen = resumen
-            row.ultima_actualizacion = ahora
-        await session.commit()
-        return row
-
-
 async def upsert_ficha_manual(
     telefono: str,
     campos: dict,
@@ -503,39 +461,6 @@ async def upsert_ficha_manual(
             row.ultima_actualizacion = ahora
         await session.commit()
         return row
-
-
-async def guardar_ficha_desde_tool(
-    telefono: str,
-    nombre: str = "",
-    email: str = "",
-) -> None:
-    """
-    Escritura desde el tool LLM `guardar_contacto`: actualiza SOLO los campos
-    provistos y no vacios, sin tocar tags/resumen. Preserva editado_manualmente.
-    """
-    ahora = datetime.utcnow()
-    async with async_session() as session:
-        q = select(Ficha).where(Ficha.telefono == telefono)
-        row = (await session.execute(q)).scalar_one_or_none()
-        if row is None:
-            row = Ficha(
-                telefono=telefono,
-                nombre=(nombre or None),
-                email=(email or None),
-                tags=[],
-                resumen=None,
-                primer_contacto=ahora,
-                ultima_actualizacion=ahora,
-            )
-            session.add(row)
-        else:
-            if nombre:
-                row.nombre = nombre
-            if email:
-                row.email = email
-            row.ultima_actualizacion = ahora
-        await session.commit()
 
 
 def ficha_to_dict(row: Ficha) -> dict:
