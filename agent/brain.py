@@ -35,6 +35,14 @@ client = AsyncOpenAI(
 # Maximo de tokens por respuesta.
 _MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
 
+# Kill switch temporal para la inyeccion de "Ficha del cliente" al system prompt.
+# Default false: reportes de respuestas erraticas atribuibles al resumen/tags
+# generados automaticamente que contradicen el historial reciente. El
+# auto-refresh en background sigue corriendo (los datos quedan frescos), solo
+# se corta la inyeccion. Reactivar con FICHA_INYECCION_ACTIVA=true en Railway
+# cuando la implementacion de la ficha reduzca el ruido.
+FICHA_INYECCION_ACTIVA = os.getenv("FICHA_INYECCION_ACTIVA", "false").lower() == "true"
+
 # Rango Unicode amplio de emojis para detectar mensajes formados solo por
 # pictografias. Incluye Emoticons, Symbols & Pictographs (con extensiones),
 # Transport, Misc Symbols, Dingbats, Flags, modificadores y ZWJ. Tambien
@@ -316,13 +324,17 @@ async def generar_respuesta(
 
     if telefono:
         try:
-            ficha_row = await obtener_ficha(telefono)
-            ficha_ctx = ficha_module.build_ficha_context(ficha_row)
-            if ficha_ctx:
-                dynamic_parts.append(ficha_ctx)
-            elif ficha_row is None:
-                # Sin ficha (cliente pre-migration o LLM aun no la genero):
-                # fallback a Contacto legacy para no perder nombre/email.
+            ficha_agregada = False
+            if FICHA_INYECCION_ACTIVA:
+                ficha_row = await obtener_ficha(telefono)
+                ficha_ctx = ficha_module.build_ficha_context(ficha_row)
+                if ficha_ctx:
+                    dynamic_parts.append(ficha_ctx)
+                    ficha_agregada = True
+            if not ficha_agregada:
+                # Fallback a Contacto legacy (nombre/email) cuando:
+                # (a) FICHA_INYECCION_ACTIVA=false (kill switch temporal), o
+                # (b) todavia no hay ficha para este cliente.
                 contacto = await obtener_contacto(telefono)
                 contact_ctx = _build_contact_context(contacto)
                 if contact_ctx:
