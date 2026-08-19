@@ -200,11 +200,44 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+# Regex para detectar placeholders de template AgentKit sin llenar (ej
+# [NOMBRE_NEGOCIO], [HORARIO]). Deben ser reemplazados por el plugin WP
+# al armar la config del cliente; si quedan crudos aca, el LLM los repite
+# al output visible del cliente. Ver _warn_placeholders_una_vez.
+_PLACEHOLDER_TEMPLATE_RE = re.compile(r"\[[A-Z][A-Z0-9_]{2,}\]")
+
+# Set de hashes de prompts ya avisados — evita spam de warnings en cada
+# request. Se limpia con reload del proceso o cambio de prompt.
+_placeholders_avisados: set[int] = set()
+
+
+def _warn_placeholders_una_vez(prompt: str) -> None:
+    """Loguea WARNING la primera vez que ve un prompt con placeholders sin llenar."""
+    if not prompt:
+        return
+    h = hash(prompt)
+    if h in _placeholders_avisados:
+        return
+    matches = _PLACEHOLDER_TEMPLATE_RE.findall(prompt)
+    if not matches:
+        _placeholders_avisados.add(h)
+        return
+    unicos = sorted(set(matches))
+    logger.warning(
+        f"system_prompt tiene placeholders sin llenar (config rota): {unicos} "
+        f"— revisar sustitucion en plugin WP. El sanitize del output los "
+        f"strippea como safety net pero deja gaps en las frases."
+    )
+    _placeholders_avisados.add(h)
+
+
 def get_system_prompt() -> str:
     cfg = get_config()
     # Nuevo schema: system_prompt a nivel raiz
     raw = cfg.get("system_prompt") or cfg.get("prompts", {}).get("system_prompt", "")
-    return _html_to_text(raw)
+    prompt = _html_to_text(raw)
+    _warn_placeholders_una_vez(prompt)
+    return prompt
 
 
 def get_fallback_message() -> str:

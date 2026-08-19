@@ -55,14 +55,26 @@ _TOKENS_BASURA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Placeholders de template AgentKit sin reemplazar (ej: [NOMBRE_NEGOCIO],
+# [NOMBRE_AGENTE], [HORARIO]). Deberian ser sustituidos por el plugin WP al
+# armar la config del cliente. Si el LLM los repite en el output, es porque
+# el system prompt los contenia crudos. Se strippean como safety net; el
+# root cause se detecta por warning en config_loader al cargar el prompt.
+_PLACEHOLDER_TEMPLATE_RE = re.compile(r"\[[A-Z][A-Z0-9_]{2,}\]")
+
 
 def _sanitize_output(texto: str) -> str:
-    """Remueve tokens tecnicos alucinados del output antes de enviar al cliente."""
+    """Remueve tokens tecnicos alucinados y placeholders sin llenar del output."""
     if not texto:
         return texto
     limpio = _TOKENS_BASURA_RE.sub("", texto)
+    limpio = _PLACEHOLDER_TEMPLATE_RE.sub("", limpio)
     # Colapsar espacios dobles que quedan tras remover tokens en medio de frase
     limpio = re.sub(r"[ \t]{2,}", " ", limpio)
+    # Colapsar coma+espacio doble tipo "de , aqui" -> "de aqui" (queda tras
+    # strippear placeholder que venia despues de una preposicion + coma)
+    limpio = re.sub(r"\s+,", ",", limpio)
+    limpio = re.sub(r"\s+\.", ".", limpio)
     return limpio.strip()
 
 # FICHA_INYECCION_ACTIVA se elimino en 1.12.0: la ficha ahora es curada por
