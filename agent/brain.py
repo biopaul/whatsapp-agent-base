@@ -33,7 +33,37 @@ client = AsyncOpenAI(
 )
 
 # Maximo de tokens por respuesta.
-_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
+# 1500 tokens ~= 1000 palabras. Cubre respuestas conversacionales largas
+# (retomes tras pausa, lecturas elaboradas, explicaciones). Antes 500 -> frases
+# cortadas a mitad de oracion. Env-overridable.
+_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "1500"))
+
+# Temperature de sampling. 0.7 = sweet spot para atencion al cliente WA:
+# natural sin ser aleatorio. Antes sin setear -> default OpenRouter ~1.0 ->
+# tokens raros ocasionales del tail de la distribucion (ej: fugas tipo
+# "s_thought" en el output, emojis random fuera de contexto). Env-overridable.
+_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.7"))
+
+# Tokens tecnicos que el modelo puede alucinar (especialmente con temperature
+# alto) y filtrarse al output visible del cliente. Se remueven silenciosamente
+# antes de devolver la respuesta. Ej reportado en produccion: "s_thought" en
+# medio de una frase. Lista conservadora — solo tokens que NUNCA deberian
+# aparecer en una conversacion humana.
+_TOKENS_BASURA_RE = re.compile(
+    r"<\s*/?\s*(?:s_thought|thought|thinking|scratchpad|reasoning|inner_?monologue|reflection)\s*/?\s*>"
+    r"|\b(?:s_thought|inner_monologue|scratchpad_start|scratchpad_end)\b",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_output(texto: str) -> str:
+    """Remueve tokens tecnicos alucinados del output antes de enviar al cliente."""
+    if not texto:
+        return texto
+    limpio = _TOKENS_BASURA_RE.sub("", texto)
+    # Colapsar espacios dobles que quedan tras remover tokens en medio de frase
+    limpio = re.sub(r"[ \t]{2,}", " ", limpio)
+    return limpio.strip()
 
 # FICHA_INYECCION_ACTIVA se elimino en 1.12.0: la ficha ahora es curada por
 # humanos (no LLM), por lo que ya no hay riesgo de alucinaciones y no se
@@ -450,6 +480,7 @@ async def generar_respuesta(
             kwargs: dict = {
                 "model": models[0],
                 "max_tokens": _MAX_TOKENS,
+                "temperature": _TEMPERATURE,
                 "messages": mensajes,
             }
             if tools:
@@ -491,7 +522,14 @@ async def generar_respuesta(
                     f"Respuesta generada ({prompt_tokens} in / {completion_tokens} out{cache_info}) "
                     f"modelo={modelo_usado} tier={tier}"
                 )
-            return respuesta
+            respuesta_limpia = _sanitize_output(respuesta)
+            if respuesta_limpia != respuesta:
+                logger.warning(
+                    f"Sanitize removio tokens tecnicos del output "
+                    f"(diff={len(respuesta) - len(respuesta_limpia)} chars) "
+                    f"modelo={getattr(response, 'model', models[0])}"
+                )
+            return respuesta_limpia
 
         # Append the assistant message (con tool_calls) al historial para que el LLM tenga contexto
         try:
