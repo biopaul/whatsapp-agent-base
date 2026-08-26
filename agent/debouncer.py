@@ -19,17 +19,41 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("agentkit")
 
 # Ventana de espera tras el ultimo mensaje. Configurable por env.
-DEBOUNCE_SEC: float = float(os.getenv("MESSAGE_DEBOUNCE_SEC", "4"))
+# 8s da tiempo natural al humano para escribir varias oraciones seguidas
+# (patron comun en WhatsApp) sin que cada envio dispare una respuesta
+# separada. Antes 4s -> aparecian dos respuestas paralelas al cliente.
+DEBOUNCE_SEC: float = float(os.getenv("MESSAGE_DEBOUNCE_SEC", "8"))
 
 # chat_id -> lista de dicts con info de cada mensaje acumulado.
 _pending_messages: dict[str, list[dict[str, Any]]] = {}
 # chat_id -> Task del proximo flush.
 _pending_tasks: dict[str, asyncio.Task] = {}
+
+
+@dataclass
+class GenerationToken:
+    """Token de una generacion IA en curso.
+
+    Cuando el debouncer recibe un nuevo mensaje para un chat que ya tiene
+    generacion activa (post-flush, con el LLM corriendo o enviando partes),
+    marca este token como invalidado. El handler chequea el flag en
+    checkpoints clave y descarta la respuesta stale antes de enviarla al
+    cliente. El nuevo mensaje se acumula normalmente en el buffer y al
+    proximo flush arranca un ciclo fresco con contexto combinado.
+    """
+    invalidated: bool = False
+
+
+# chat_id -> token de la generacion IA que esta corriendo AHORA (post-flush).
+# Se puebla desde el handler via register_generation y se elimina via
+# unregister_generation. schedule() marca .invalidated=True si encuentra uno.
+_active_generations: dict[str, GenerationToken] = {}
 
 
 def schedule(
@@ -59,7 +83,36 @@ def schedule(
     prev = _pending_tasks.get(chat_id)
     if prev and not prev.done():
         prev.cancel()
+    # Invalidar cualquier generacion IA que este corriendo para este chat
+    # (post-flush con LLM/envio en vuelo). El handler chequea el flag en
+    # checkpoints y descarta la respuesta stale antes de enviarla.
+    active = _active_generations.get(chat_id)
+    if active is not None and not active.invalidated:
+        active.invalidated = True
+        logger.info(
+            f"Debounce: mensaje nuevo invalida generacion en vuelo para {chat_id}"
+        )
     _pending_tasks[chat_id] = asyncio.create_task(_flush(chat_id, handler))
+
+
+def register_generation(chat_id: str) -> GenerationToken:
+    """El handler llama esto al empezar el ciclo IA. Retorna un token que se
+    invalida si llega otro mensaje mientras la generacion esta en vuelo.
+
+    Si ya habia un token registrado (reentry por bug), lo reemplaza — el
+    anterior queda huerfano pero no genera efectos (solo el chequeo del flag)."""
+    token = GenerationToken()
+    _active_generations[chat_id] = token
+    return token
+
+
+def unregister_generation(chat_id: str, token: GenerationToken) -> None:
+    """El handler llama esto al terminar (en finally) para limpiar el registro.
+
+    Solo elimina si el token guardado es el mismo — evita borrar el token de
+    una generacion que arranco entretanto (poco probable, pero seguro)."""
+    if _active_generations.get(chat_id) is token:
+        del _active_generations[chat_id]
 
 
 async def _flush(chat_id: str, handler: Callable[..., Awaitable[None]]) -> None:
@@ -115,12 +168,13 @@ async def _flush(chat_id: str, handler: Callable[..., Awaitable[None]]) -> None:
 
 
 def clear() -> None:
-    """Limpia todos los buffers/tasks. Util para tests."""
+    """Limpia todos los buffers/tasks/generaciones. Util para tests."""
     for task in _pending_tasks.values():
         if not task.done():
             task.cancel()
     _pending_tasks.clear()
     _pending_messages.clear()
+    _active_generations.clear()
 
 
 def pending_count(chat_id: str) -> int:

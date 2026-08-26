@@ -713,6 +713,12 @@ async def _procesar_y_responder(
     """
     caps = get_capabilities()
 
+    # Guardar el user tempranamente. Si mas abajo la generacion se invalida
+    # (llega otro mensaje del cliente mientras el LLM esta corriendo),
+    # descartamos la respuesta assistant pero el user ya quedo en el
+    # historial — asi el proximo ciclo tiene contexto coherente.
+    await guardar_mensaje(chat_id, "user", texto, mensaje_id=mensaje_id)
+
     # Nota 1.12.0: eliminamos el trigger de auto-recalculo de ficha via LLM.
     # La ficha ahora es curada 100% por humanos desde el plugin WP (PUT /ficha).
     # No hay costo LLM extra en background ni riesgo de alucinaciones.
@@ -860,102 +866,138 @@ async def _procesar_y_responder(
         )
         contexto = f"{contexto}\n{nota_vision}".strip() if contexto else nota_vision
 
-    # Generar respuesta con Claude
-    respuesta = await generar_respuesta(
-        texto, historial, contexto, telefono=chat_id, media_blocks=media_blocks
-    )
+    # Registrar generacion IA invalidable. Si llega otro mensaje del cliente
+    # mientras el LLM esta corriendo o mientras enviamos partes, debouncer
+    # marca _gen_token.invalidated=True y descartamos en checkpoints antes
+    # de mandar respuesta stale.
+    _gen_token = debouncer.register_generation(chat_id)
+    try:
+        # Generar respuesta con Claude
+        respuesta = await generar_respuesta(
+            texto, historial, contexto, telefono=chat_id, media_blocks=media_blocks
+        )
 
-    # Detectar marker [PAGO_VERIFICADO] y limpiarlo del texto.
-    # Dispara mark_as_customer en el plugin (fire-and-forget).
-    respuesta, pago_verificado = vision.extract_pago_verificado(respuesta)
-    if pago_verificado:
-        if not respuesta:
-            respuesta = "Perfecto, confirmé tu pago. Seguimos."
-        asyncio.create_task(contacts_webhook.mark_as_customer(
-            chat_id=chat_id,
-            is_customer=True,
-            source="payment_receipt_image",
-        ))
-        logger.info(f"PAGO_VERIFICADO para {chat_id} → mark_as_customer disparado")
-
-    # Si Claude indica silencio, guardar en DB y no enviar
-    if respuesta.strip() == "SILENCIO":
-        await guardar_mensaje(chat_id, "user", texto)
-        await guardar_mensaje(chat_id, "assistant", "SILENCIO")
-        logger.info(f"Silencio activado para {chat_id}")
-        return
-
-    # Detectar senal de escalado: ESCALAR: <motivo>\n<mensaje al cliente>
-    # En modo individual el bloque del system prompt le dice al LLM que NO emita
-    # el marcador. Defensa profunda: si igual aparece (modelo desobedece o cache
-    # antiguo de prompt), lo limpiamos del texto pero NO disparamos escalacion
-    # (no hay equipo a quien escalar). Loggeamos para auditoria.
-    motivo_escalar = None
-    if respuesta.startswith("ESCALAR:"):
-        primera_linea, _, resto = respuesta.partition("\n")
-        if is_solo_mode():
-            logger.warning(
-                f"ESCALAR: emitido en modo solo (LLM ignoro instruccion); "
-                f"limpiando marker sin disparar escalacion. chat={chat_id} "
-                f"motivo='{primera_linea[len('ESCALAR:'):].strip()[:80]}'"
+        # Checkpoint post-LLM: si el cliente escribio algo nuevo mientras
+        # generabamos, descartamos silenciosamente. El user ya fue guardado
+        # al inicio; el proximo ciclo del debouncer arranca fresco con
+        # contexto combinado y responde una sola vez.
+        if _gen_token.invalidated:
+            logger.info(
+                f"Respuesta descartada por invalidacion (mensaje nuevo llego "
+                f"durante generacion): chat={chat_id} len={len(respuesta or '')}"
             )
-            resto_limpio = resto.strip()
-            # Si el LLM solo emitio el marker sin texto para el cliente, usamos
-            # un fallback amable para no enviar mensaje vacio.
-            respuesta = resto_limpio if resto_limpio else "Decime, ¿en qué puedo ayudarte?"
-        else:
-            motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
-            respuesta = resto.strip()
+            return
 
-    # Detectar señal de envio de archivo: ENVIAR_ARCHIVO:<nombre>
-    archivo_nombre: str | None = None
-    respuesta, archivo_nombre = _parsear_enviar_archivo(respuesta)
+        # Detectar marker [PAGO_VERIFICADO] y limpiarlo del texto.
+        # Dispara mark_as_customer en el plugin (fire-and-forget).
+        respuesta, pago_verificado = vision.extract_pago_verificado(respuesta)
+        if pago_verificado:
+            if not respuesta:
+                respuesta = "Perfecto, confirmé tu pago. Seguimos."
+            asyncio.create_task(contacts_webhook.mark_as_customer(
+                chat_id=chat_id,
+                is_customer=True,
+                source="payment_receipt_image",
+            ))
+            logger.info(f"PAGO_VERIFICADO para {chat_id} → mark_as_customer disparado")
 
-    # Guardar mensaje del usuario; el assistant se persiste por parte via send_user_message
-    await guardar_mensaje(chat_id, "user", texto)
+        # Si Claude indica silencio, guardar assistant SILENCIO y no enviar.
+        # El user ya se guardo al inicio de la funcion.
+        if respuesta.strip() == "SILENCIO":
+            await guardar_mensaje(chat_id, "assistant", "SILENCIO")
+            logger.info(f"Silencio activado para {chat_id}")
+            return
 
-    # Dividir en partes si Claude uso separador ---
-    partes = _dividir_partes(respuesta)
-
-    # TTS config: si fue_audio + gates OK, send_audio_or_text envia voice note
-    tts_config = get_tts_config()
-
-    for idx, parte in enumerate(partes):
-        delay = max(1, min(round(len(parte) * 0.025), 5))
-        if idx == 0:
-            # Primera parte: indicador de presencia segun tipo de mensaje
-            if fue_audio:
-                await proveedor.indicar_grabando(chat_id)
+        # Detectar senal de escalado: ESCALAR: <motivo>\n<mensaje al cliente>
+        # En modo individual el bloque del system prompt le dice al LLM que NO emita
+        # el marcador. Defensa profunda: si igual aparece (modelo desobedece o cache
+        # antiguo de prompt), lo limpiamos del texto pero NO disparamos escalacion
+        # (no hay equipo a quien escalar). Loggeamos para auditoria.
+        motivo_escalar = None
+        if respuesta.startswith("ESCALAR:"):
+            primera_linea, _, resto = respuesta.partition("\n")
+            if is_solo_mode():
+                logger.warning(
+                    f"ESCALAR: emitido en modo solo (LLM ignoro instruccion); "
+                    f"limpiando marker sin disparar escalacion. chat={chat_id} "
+                    f"motivo='{primera_linea[len('ESCALAR:'):].strip()[:80]}'"
+                )
+                resto_limpio = resto.strip()
+                # Si el LLM solo emitio el marker sin texto para el cliente, usamos
+                # un fallback amable para no enviar mensaje vacio.
+                respuesta = resto_limpio if resto_limpio else "Decime, ¿en qué puedo ayudarte?"
             else:
+                motivo_escalar = primera_linea[len("ESCALAR:"):].strip()
+                respuesta = resto.strip()
+
+        # Detectar señal de envio de archivo: ENVIAR_ARCHIVO:<nombre>
+        archivo_nombre: str | None = None
+        respuesta, archivo_nombre = _parsear_enviar_archivo(respuesta)
+
+        # El user ya se guardo al inicio de la funcion. Aca solo persistimos
+        # cada parte assistant via send_user_message dentro del loop de partes.
+
+        # Dividir en partes si Claude uso separador ---
+        partes = _dividir_partes(respuesta)
+
+        # TTS config: si fue_audio + gates OK, send_audio_or_text envia voice note
+        tts_config = get_tts_config()
+
+        partes_enviadas = 0
+        for idx, parte in enumerate(partes):
+            # Checkpoint mid-envio: si llego otro mensaje entre partes, cortamos
+            # el resto. Las partes ya enviadas quedan en el historial; el
+            # proximo ciclo continua desde ese contexto.
+            if _gen_token.invalidated:
+                logger.info(
+                    f"Envio parcial por invalidacion: {idx}/{len(partes)} partes "
+                    f"enviadas antes de cortar. chat={chat_id}"
+                )
+                break
+            delay = max(1, min(round(len(parte) * 0.025), 5))
+            if idx == 0:
+                # Primera parte: indicador de presencia segun tipo de mensaje
+                if fue_audio:
+                    await proveedor.indicar_grabando(chat_id)
+                else:
+                    await proveedor.indicar_escribiendo(chat_id, delay)
+            else:
+                # Partes siguientes: siempre "escribiendo" con pausa realista
                 await proveedor.indicar_escribiendo(chat_id, delay)
-        else:
-            # Partes siguientes: siempre "escribiendo" con pausa realista
-            await proveedor.indicar_escribiendo(chat_id, delay)
-        await asyncio.sleep(delay)
-        await send_audio_or_text(chat_id, parte, fue_audio=fue_audio, tts_config=tts_config)
+            await asyncio.sleep(delay)
+            await send_audio_or_text(chat_id, parte, fue_audio=fue_audio, tts_config=tts_config)
+            partes_enviadas += 1
 
-    logger.info(
-        f"Respuesta a {chat_id} ({len(partes)} parte/s, {message_count} msg combinados): "
-        f"{respuesta[:120]}"
-    )
+        # Si se corto todo antes de enviar cualquier parte, no logueamos como envio
+        # exitoso (ya se logueo la invalidacion).
+        if partes_enviadas == 0:
+            return
 
-    # Reportar uso al plugin WP (no-bloqueante)
-    await usage_reporter.report(chat_id)
+        logger.info(
+            f"Respuesta a {chat_id} ({partes_enviadas}/{len(partes)} parte/s, "
+            f"{message_count} msg combinados): {respuesta[:120]}"
+        )
 
-    # Enviar archivo publico si Claude lo solicito
-    if archivo_nombre:
-        public_docs = get_public_docs()
-        doc = next((d for d in public_docs if d["name"] == archivo_nombre), None)
-        if doc and doc.get("url"):
-            ok_file = await proveedor.enviar_archivo(chat_id, doc["url"], archivo_nombre)
-            if ok_file:
-                outbound.register_agent_outbound(chat_id)
-        else:
-            logger.warning(f"Archivo publico no encontrado: {archivo_nombre!r}")
+        # Reportar uso al plugin WP (no-bloqueante)
+        await usage_reporter.report(chat_id)
 
-    if motivo_escalar:
-        await _activar_escalacion(chat_id, motivo_escalar)
-        logger.info(f"Escalacion completada (alerta + takeover + label): {motivo_escalar}")
+        # Enviar archivo publico si Claude lo solicito. Chequeamos invalidacion
+        # tambien aca — envio de archivo tambien puede tardar.
+        if archivo_nombre and not _gen_token.invalidated:
+            public_docs = get_public_docs()
+            doc = next((d for d in public_docs if d["name"] == archivo_nombre), None)
+            if doc and doc.get("url"):
+                ok_file = await proveedor.enviar_archivo(chat_id, doc["url"], archivo_nombre)
+                if ok_file:
+                    outbound.register_agent_outbound(chat_id)
+            else:
+                logger.warning(f"Archivo publico no encontrado: {archivo_nombre!r}")
+
+        if motivo_escalar and not _gen_token.invalidated:
+            await _activar_escalacion(chat_id, motivo_escalar)
+            logger.info(f"Escalacion completada (alerta + takeover + label): {motivo_escalar}")
+    finally:
+        debouncer.unregister_generation(chat_id, _gen_token)
 
 
 @app.post("/webhook/messages")
