@@ -419,10 +419,21 @@ async def actualizar_remote_dispatch_id(local_id: int, remote_id: int) -> None:
 # ------------------------------------------------------------------ Fichas ---
 
 async def obtener_ficha(telefono: str) -> Ficha | None:
-    """Retorna la Ficha por telefono o None si no existe."""
+    """Retorna la Ficha por telefono o None si no existe.
+
+    Prueba variantes del telefono (@c.us, @s.whatsapp.net, sin sufijo) si
+    el match exacto no aparece. Sin este fallback, una ficha guardada con
+    un sufijo distinto al del chat_id activo queda invisible y el LLM
+    responde sin contexto (bug latente reportado en produccion — cliente
+    con ficha en WP pero agente actuando como si estuviera vacia).
+    """
     async with async_session() as session:
-        q = select(Ficha).where(Ficha.telefono == telefono)
-        return (await session.execute(q)).scalar_one_or_none()
+        for variante in _telefono_variantes(telefono):
+            q = select(Ficha).where(Ficha.telefono == variante)
+            row = (await session.execute(q)).scalar_one_or_none()
+            if row is not None:
+                return row
+    return None
 
 
 async def upsert_ficha_manual(
