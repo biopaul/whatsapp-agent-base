@@ -90,7 +90,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def is_chat_in_manual_mode(chat_id: str) -> bool:
+async def is_chat_in_manual_mode(chat_id: str, fresh: bool = False) -> bool:
     """
     Retorna True si el chat esta en manual mode segun el plugin.
     Politica de cache:
@@ -98,6 +98,13 @@ async def is_chat_in_manual_mode(chat_id: str) -> bool:
     - Auto: trust POLL_INTERVAL_AUTO segundos.
     - Sin cache o cache vencida: re-poll.
     - Fail-open: si la red falla y no hay cache util, asume auto.
+
+    fresh=True bypass del TTL de "auto": aunque haya cache reciente diciendo
+    auto, fuerza re-poll. Uso: checkpoints criticos antes del LLM y antes de
+    enviar respuesta al cliente — sin esto, si el humano activa manual dentro
+    de los POLL_INTERVAL_AUTO segundos del ultimo poll, el agente respondia
+    con el estado stale (bug reportado en produccion). La cache de "manual"
+    con expires_at futuro NO se bypasea (ya es fresca por definicion).
     """
     if not _is_enabled():
         return False
@@ -109,7 +116,11 @@ async def is_chat_in_manual_mode(chat_id: str) -> bool:
     if entry is not None:
         if entry.mode == "manual" and entry.expires_at and entry.expires_at > now:
             return True
-        if entry.mode == "auto" and (now - entry.last_polled).total_seconds() < POLL_INTERVAL_AUTO:
+        if (
+            not fresh
+            and entry.mode == "auto"
+            and (now - entry.last_polled).total_seconds() < POLL_INTERVAL_AUTO
+        ):
             return False
 
     # Necesitamos pollear

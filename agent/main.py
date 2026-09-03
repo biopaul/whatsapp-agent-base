@@ -276,7 +276,7 @@ async def send_user_message(chat_id: str, text: str) -> bool:
 
     Returns: True si se envio, False si se descarto o fallo el envio.
     """
-    if await takeover.is_chat_in_manual_mode(chat_id):
+    if await takeover.is_chat_in_manual_mode(chat_id, fresh=True):
         logger.info(f"discard_response reason=manual_mode_during_generation chat_id={chat_id}")
         return False
 
@@ -872,6 +872,16 @@ async def _procesar_y_responder(
     # de mandar respuesta stale.
     _gen_token = debouncer.register_generation(chat_id)
     try:
+        # Checkpoint pre-LLM: fresh check de manual mode. Cubre la ventana
+        # donde el humano activo manual entre el poll cacheado del webhook
+        # y este momento (hasta 30s con TTL default). Sin fresh=True, la
+        # cache de "auto" oculta el cambio y el LLM corre en vano.
+        if await takeover.is_chat_in_manual_mode(chat_id, fresh=True):
+            logger.info(
+                f"skip_response reason=manual_mode_pre_llm chat_id={chat_id}"
+            )
+            return
+
         # Generar respuesta con Claude
         respuesta = await generar_respuesta(
             texto, historial, contexto, telefono=chat_id, media_blocks=media_blocks
@@ -951,6 +961,16 @@ async def _procesar_y_responder(
             if _gen_token.invalidated:
                 logger.info(
                     f"Envio parcial por invalidacion: {idx}/{len(partes)} partes "
+                    f"enviadas antes de cortar. chat={chat_id}"
+                )
+                break
+            # Checkpoint mid-envio: manual mode con fresh check. Si el humano
+            # activo takeover entre partes (envio puede tardar 5-20s con delays
+            # naturales), cortamos las partes restantes. send_user_message ya
+            # chequea con fresh=True, pero cortar aca ahorra el delay+presencia.
+            if idx > 0 and await takeover.is_chat_in_manual_mode(chat_id, fresh=True):
+                logger.info(
+                    f"Envio parcial por manual_mode: {idx}/{len(partes)} partes "
                     f"enviadas antes de cortar. chat={chat_id}"
                 )
                 break
