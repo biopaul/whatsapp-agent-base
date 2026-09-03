@@ -37,6 +37,11 @@ HTTP_TIMEOUT = float(os.getenv("TAKEOVER_HTTP_TIMEOUT", "5"))  # segundos
 # parseable. El plugin WP define el TTL real (actualmente 40min).
 MANUAL_FALLBACK_TTL_MIN = int(os.getenv("TAKEOVER_MANUAL_TTL_MIN", "40"))
 
+# Shared secret para POST /takeover/refresh — el plugin WP envia este token
+# en X-Refresh-Token cuando notifica un cambio de modo del chat. Sin esta
+# env var seteada, el endpoint rechaza toda request (deshabilitado seguro).
+REFRESH_TOKEN = os.getenv("TAKEOVER_REFRESH_TOKEN", "")
+
 
 def _resolve_takeover_base() -> str:
     """
@@ -142,6 +147,64 @@ async def is_chat_in_manual_mode(chat_id: str, fresh: bool = False) -> bool:
     if new_entry.mode == "manual" and new_entry.expires_at and new_entry.expires_at > now:
         return True
     return False
+
+
+def apply_push_update(
+    chat_id: str,
+    mode: Literal["auto", "manual"],
+    expires_at: Optional[datetime] = None,
+) -> Literal["updated", "unchanged"]:
+    """
+    Aplica un update push del plugin WP a la cache local. Se invoca desde el
+    endpoint POST /takeover/refresh cuando el humano cambia el toggle en el
+    admin del plugin (o cuando el TTL de manual expira).
+
+    Idempotente: si el estado ya es igual al que se pide (mismo mode, y para
+    mode=manual con expires_at dentro de una tolerancia de 60s), retorna
+    "unchanged" sin tocar la cache.
+
+    Preserva last_manual_until al transicionar de manual -> auto (mismo
+    comportamiento que el poll normal).
+
+    Retorna "updated" o "unchanged" para que el caller decida el status HTTP.
+    """
+    if mode not in ("auto", "manual"):
+        raise ValueError(f"mode invalido: {mode!r}")
+    if mode == "manual" and expires_at is None:
+        raise ValueError("mode=manual requiere expires_at")
+
+    now = _now()
+    entry = _cache.get(chat_id)
+
+    # Idempotencia: mismo estado ya cacheado
+    if entry is not None and entry.mode == mode:
+        if mode == "auto":
+            return "unchanged"
+        # mode == "manual": comparar expires_at con tolerancia (60s)
+        if entry.expires_at and expires_at:
+            delta = abs((entry.expires_at - expires_at).total_seconds())
+            if delta < 60:
+                return "unchanged"
+
+    new_entry = TakeoverEntry(
+        mode=mode,
+        expires_at=expires_at if mode == "manual" else None,
+        last_polled=now,
+    )
+
+    # Preservar last_manual_until al transicionar manual -> auto (igual que
+    # el path del poll normal)
+    if entry is not None and entry.mode == "manual" and mode == "auto":
+        new_entry.last_manual_until = entry.expires_at
+    elif entry is not None and entry.last_manual_until is not None:
+        new_entry.last_manual_until = entry.last_manual_until
+
+    _cache[chat_id] = new_entry
+    logger.info(
+        f"takeover cache refreshed via push chat_id={chat_id} mode={mode}"
+        + (f" expires_at={expires_at.isoformat()}" if expires_at else "")
+    )
+    return "updated"
 
 
 def is_chat_customer(chat_id: str) -> tuple[bool, Optional[datetime]]:

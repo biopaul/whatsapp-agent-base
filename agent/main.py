@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from dotenv import load_dotenv
 
 from agent.brain import generar_respuesta
@@ -1225,6 +1225,77 @@ async def agent_notification(
         raise HTTPException(status_code=502, detail="provider failed")
 
     return {"status": "sent"}
+
+
+@app.post("/takeover/refresh")
+async def takeover_refresh(
+    request: Request,
+    x_refresh_token: str = Header(default=""),
+):
+    """
+    Push del plugin WP para refrescar la cache de takeover del chat.
+
+    Cuando el humano toca el toggle Manual/Auto en el admin del plugin
+    (o cuando el TTL de manual expira del lado WP), el plugin envia este
+    POST para que el agente actualice su cache al instante — sin esperar
+    al proximo poll cacheado (30s TTL default).
+
+    Cierra la ventana de exposicion del bug de manual mode stale (v1.14.0
+    ya lo mitigo con fresh=True en checkpoints; este endpoint lo elimina).
+
+    Auth: header X-Refresh-Token debe matchear TAKEOVER_REFRESH_TOKEN env.
+    Si el env var no esta seteada, el endpoint queda deshabilitado y
+    responde 401 a todo (fail-safe).
+
+    Body JSON: {
+        "chat_id": "5491155@c.us",
+        "mode": "manual" | "auto",
+        "expires_at": "2026-09-05T14:30:00Z"  # ISO 8601, requerido si mode=manual
+    }
+
+    Responses:
+    - 200 {"status": "updated"} — cache actualizada.
+    - 204 — cache ya reflejaba el estado (idempotente noop).
+    - 400 — body invalido.
+    - 401 — token invalido o endpoint deshabilitado.
+    """
+    if not takeover.REFRESH_TOKEN or x_refresh_token != takeover.REFRESH_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid refresh token")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    chat_id = str(body.get("chat_id", "") or "").strip()
+    mode = str(body.get("mode", "") or "").strip().lower()
+    expires_at_raw = body.get("expires_at")
+
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="missing chat_id")
+    if mode not in ("auto", "manual"):
+        raise HTTPException(status_code=400, detail="mode must be 'auto' or 'manual'")
+
+    expires_at = None
+    if mode == "manual":
+        if not expires_at_raw:
+            raise HTTPException(status_code=400, detail="expires_at required for mode=manual")
+        # Parseo ISO 8601, tolerando el sufijo "Z" (UTC) que Python < 3.11 no
+        # entendia directamente. Ejemplo aceptado: "2026-09-05T14:30:00Z".
+        try:
+            iso = str(expires_at_raw).replace("Z", "+00:00")
+            expires_at = datetime.fromisoformat(iso)
+        except Exception:
+            raise HTTPException(status_code=400, detail="expires_at invalid ISO 8601")
+
+    try:
+        result = takeover.apply_push_update(chat_id, mode, expires_at)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if result == "unchanged":
+        return Response(status_code=204)
+    return {"status": result}
 
 
 def _check_gowap_token(x_gowap_token: str) -> None:
