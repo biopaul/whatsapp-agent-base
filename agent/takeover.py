@@ -384,8 +384,17 @@ async def _poll_chat(chat_id: str) -> Optional[TakeoverEntry]:
         if isinstance(raw, str) and raw:
             expires_at = _parse_iso(raw)
         if expires_at is None:
-            logger.warning(f"Takeover poll {chat_id}: manual sin expires_at valido - tratando como auto")
-            mode = "auto"
+            # El plugin WP siempre devuelve expires_at=null en /takeover cuando
+            # el humano marca manual desde el admin (no expone TTL en la
+            # respuesta). Antes: degradabamos silenciosamente a "auto" — bug
+            # critico que hizo que el modo manual nunca funcionara via poll.
+            # Ahora: fallback al TTL default (MANUAL_FALLBACK_TTL_MIN, 40min).
+            # El proximo poll refresca el timer.
+            expires_at = _now() + timedelta(minutes=MANUAL_FALLBACK_TTL_MIN)
+            logger.info(
+                f"Takeover poll {chat_id}: manual sin expires_at, fallback "
+                f"+{MANUAL_FALLBACK_TTL_MIN}min"
+            )
 
     # Update customer cache (mismo poll, response extendida con is_customer/customer_since)
     _update_customer_cache_from_response(chat_id, body)
