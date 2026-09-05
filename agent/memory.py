@@ -200,14 +200,21 @@ async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
 def _telefono_variantes(telefono: str) -> list[str]:
     """
     Genera variantes del identificador para tolerar formatos historicos:
-    - "X@c.us" | "X@s.whatsapp.net" | "X" (sin sufijo).
+    - "X@c.us" | "X@s.whatsapp.net" | "X@lid" | "X" (sin sufijo).
     Preserva el input original como primera variante para priorizar match exacto.
+
+    @lid = Linked ID de WhatsApp. Algunos contactos (típicamente cuentas
+    Business o multi-device) llegan por webhook como X@lid en vez de X@c.us.
+    El plugin WP en v2.57.0+ resuelve @lid → @c.us en su lado (GET /takeover),
+    pero la cache in-memory del agente puede tener entries bajo AMBAS
+    variantes segun quien la haya poblado (poll con @lid vs push con @c.us).
+    Iterar variantes hace el lookup insensible al sufijo.
     """
     if not telefono:
         return []
     variantes = [telefono]
     numero = telefono.split("@", 1)[0]
-    for suf in ("@c.us", "@s.whatsapp.net", ""):
+    for suf in ("@c.us", "@s.whatsapp.net", "@lid", ""):
         cand = f"{numero}{suf}" if suf else numero
         if cand and cand not in variantes:
             variantes.append(cand)

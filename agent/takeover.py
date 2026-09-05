@@ -95,6 +95,30 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _cache_variantes(chat_id: str) -> list[str]:
+    """Variantes del chat_id para lookup insensible al sufijo.
+
+    Escenario: el push del plugin cachea con "X@c.us" (canonical) pero el
+    webhook posterior de WAHA llega con "X@lid" (linked id) — o viceversa.
+    Sin este iterador, cada entrada quedaria aislada en su propio key y el
+    check de manual mode fallaria hasta que la otra variante se poblara via
+    poll. Con iteracion, el primer match gana.
+
+    Se prioriza el input exacto (para no cambiar el behavior comun de un
+    solo hit) y se iteran los sufijos conocidos de WAHA/WhatsApp: @c.us,
+    @s.whatsapp.net, @lid, y sin sufijo (algunos plugins guardan asi).
+    """
+    if not chat_id:
+        return []
+    variantes = [chat_id]
+    numero = chat_id.split("@", 1)[0]
+    for suf in ("@c.us", "@s.whatsapp.net", "@lid", ""):
+        cand = f"{numero}{suf}" if suf else numero
+        if cand and cand not in variantes:
+            variantes.append(cand)
+    return variantes
+
+
 async def is_chat_in_manual_mode(chat_id: str, fresh: bool = False) -> bool:
     """
     Retorna True si el chat esta en manual mode segun el plugin.
@@ -115,7 +139,14 @@ async def is_chat_in_manual_mode(chat_id: str, fresh: bool = False) -> bool:
         return False
 
     now = _now()
-    entry = _cache.get(chat_id)
+    # Lookup insensible al sufijo: el chat puede estar en cache bajo @c.us
+    # (por push del plugin) mientras el webhook llega con @lid, o al reves.
+    # Priorizamos match exacto y caemos a otras variantes.
+    entry = None
+    for variante in _cache_variantes(chat_id):
+        entry = _cache.get(variante)
+        if entry is not None:
+            break
 
     # Cache hit valido?
     if entry is not None:
@@ -174,7 +205,15 @@ def apply_push_update(
         raise ValueError("mode=manual requiere expires_at")
 
     now = _now()
-    entry = _cache.get(chat_id)
+    # Lookup insensible al sufijo — ver comentario en is_chat_in_manual_mode.
+    # Priorizamos match exacto para idempotencia predecible.
+    entry = None
+    matched_key = chat_id
+    for variante in _cache_variantes(chat_id):
+        entry = _cache.get(variante)
+        if entry is not None:
+            matched_key = variante
+            break
 
     # Idempotencia: mismo estado ya cacheado
     if entry is not None and entry.mode == mode:
@@ -198,6 +237,11 @@ def apply_push_update(
         new_entry.last_manual_until = entry.expires_at
     elif entry is not None and entry.last_manual_until is not None:
         new_entry.last_manual_until = entry.last_manual_until
+
+    # Si la entry previa estaba bajo una variante distinta (@lid vs @c.us),
+    # eliminarla para no dejar 2 estados divergentes del mismo chat en cache.
+    if matched_key != chat_id and matched_key in _cache:
+        del _cache[matched_key]
 
     _cache[chat_id] = new_entry
     logger.info(
@@ -384,17 +428,17 @@ async def _poll_chat(chat_id: str) -> Optional[TakeoverEntry]:
         if isinstance(raw, str) and raw:
             expires_at = _parse_iso(raw)
         if expires_at is None:
-            # El plugin WP siempre devuelve expires_at=null en /takeover cuando
-            # el humano marca manual desde el admin (no expone TTL en la
-            # respuesta). Antes: degradabamos silenciosamente a "auto" — bug
-            # critico que hizo que el modo manual nunca funcionara via poll.
-            # Ahora: fallback al TTL default (MANUAL_FALLBACK_TTL_MIN, 40min).
-            # El proximo poll refresca el timer.
-            expires_at = _now() + timedelta(minutes=MANUAL_FALLBACK_TTL_MIN)
-            logger.info(
-                f"Takeover poll {chat_id}: manual sin expires_at, fallback "
-                f"+{MANUAL_FALLBACK_TTL_MIN}min"
+            # Contract del plugin (v2.57.0+): siempre devuelve expires_at ISO
+            # cuando mode=manual (calculado por request como NOW + TTL, no
+            # depende del DB). Si llega aca es bug del plugin o cambio de
+            # contrato — tratar como auto defensivo y avisar loud para
+            # investigar. El fallback +TTL local que teniamos en v1.15.1
+            # ocultaba fallas del contrato.
+            logger.warning(
+                f"Takeover poll {chat_id}: manual con expires_at invalido "
+                f"(plugin debe garantizar ISO): {raw!r} - tratando como auto"
             )
+            mode = "auto"
 
     # Update customer cache (mismo poll, response extendida con is_customer/customer_since)
     _update_customer_cache_from_response(chat_id, body)
