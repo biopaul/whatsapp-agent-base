@@ -170,13 +170,25 @@ async def _send_with_retry(events: list[dict]) -> None:
                 return
 
             elif resp.status_code == 404:
-                error_body = resp.json() if resp.content else {}
-                logger.error(
-                    f"USAGE_URL invalida (404) {error_body.get('code', '')} "
-                    "— reportes deshabilitados hasta reinicio"
+                error_body = {}
+                try:
+                    error_body = resp.json() if resp.content else {}
+                except Exception:
+                    error_body = {}
+                code = str(error_body.get("code", "") or "")
+                # Solo deshabilitar si WP confirma token invalido. Un 404 generico
+                # (deploy, Cloudflare, proxy) no debe matar el reporter hasta reinicio.
+                if code in ("usage_token_invalid", "invalid_token", "rest_no_route"):
+                    logger.error(
+                        f"USAGE_URL invalida (404 {code}) "
+                        "— reportes deshabilitados hasta reinicio"
+                    )
+                    _bad_token = True
+                    return
+                logger.warning(
+                    f"Usage HTTP 404 sin token_invalid ({code or 'sin code'}), "
+                    f"intento {attempt + 1}/{_MAX_RETRIES}"
                 )
-                _bad_token = True
-                return
 
             elif resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning(

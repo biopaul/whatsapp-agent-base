@@ -150,8 +150,8 @@ async def test_send_404_deshabilita_reporter():
 
     resp_404 = MagicMock()
     resp_404.status_code = 404
-    resp_404.content = b'{"code":"invalid_token"}'
-    resp_404.json.return_value = {"code": "invalid_token"}
+    resp_404.content = b'{"code":"usage_token_invalid"}'
+    resp_404.json.return_value = {"code": "usage_token_invalid"}
 
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -163,6 +163,33 @@ async def test_send_404_deshabilita_reporter():
 
     assert ur._bad_token is True
     ur._bad_token = False  # cleanup
+
+
+@pytest.mark.asyncio
+async def test_send_404_generico_no_deshabilita_reporter():
+    """Un 404 de proxy/deploy no debe matar el reporter hasta reinicio."""
+    import agent.usage_reporter as ur
+    ur.USAGE_URL = "http://fake-url/usage/tok"
+    ur._bad_token = False
+    ur._MAX_RETRIES = 2
+
+    resp_404 = MagicMock()
+    resp_404.status_code = 404
+    resp_404.content = b"<html>Not Found</html>"
+    resp_404.json.side_effect = ValueError("no json")
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=resp_404)
+
+    with patch("agent.usage_reporter.asyncio.sleep", new=AsyncMock()):
+        with patch("agent.usage_reporter.httpx.AsyncClient", return_value=mock_client):
+            await ur._send_with_retry([{"type": "message", "chat_id": "x", "at": 0}])
+
+    assert ur._bad_token is False
+    ur._MAX_RETRIES = 5
+    ur._bad_token = False
 
 
 @pytest.mark.asyncio
