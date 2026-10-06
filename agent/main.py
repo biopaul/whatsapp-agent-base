@@ -16,10 +16,10 @@ from fastapi.responses import PlainTextResponse, Response
 from dotenv import load_dotenv
 
 from agent.brain import generar_respuesta
-from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp, existe_mensaje_id
+from agent.memory import inicializar_db, guardar_mensaje, obtener_historial, obtener_ultimo_timestamp, existe_mensaje_id, _telefono_variantes
 from agent import brain
 from agent.providers import obtener_proveedor
-from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config, is_solo_mode, get_ai_models
+from agent.config_loader import get_notify_phone, get_notify_name, get_tz_offset, get_capabilities, is_within_business_hours, get_out_of_hours_message, invalidate_cache, is_agent_paused, get_pause_reason, get_config_updated_at, get_tts_config, is_solo_mode, get_ai_models, get_blocked_chat_ids
 from agent.transcriber import procesar_audio
 from agent.reactions import elegir_reaccion
 from agent.knowledge_loader import get_public_docs
@@ -1065,6 +1065,18 @@ async def webhook_handler(request: Request):
                     f"Skip duplicado (replay WAHA): mensaje_id={_mid_entrante} "
                     f"chat={msg.telefono}"
                 )
+                continue
+
+            # Bloqueo por WordPress (fuente de verdad, no depende de WAHA).
+            # WP entrega blocked_chat_ids en la config; si el JID entrante
+            # (o alguna variante @c.us/@lid/...) coincide, silencio total:
+            # no LLM, no tools, no vision, no TTS, no usage, ni siquiera se
+            # persiste el mensaje. ACK silencioso al webhook. Chequeo aca
+            # (post-dedup, pre-manual/pause/horario) para no gastar nada
+            # y no atribuir usage al agente.
+            _blocked = get_blocked_chat_ids()
+            if _blocked and any(v in _blocked for v in _telefono_variantes(msg.telefono)):
+                logger.info(f"skipped_blocked_chat chat_id={msg.telefono}")
                 continue
 
             # Checkpoint manual mode: persistir entrante + skip LLM/respuesta

@@ -324,6 +324,20 @@ def get_capabilities() -> dict:
     return {k: bool(caps.get(k, v)) for k, v in defaults.items()}
 
 
+def get_blocked_chat_ids() -> frozenset[str]:
+    """Set de chat_ids bloqueados desde WP (fuente de verdad).
+
+    El plugin WP entrega `blocked_chat_ids: string[]` en la config. Cada
+    entrada es un JID (puede ser @c.us o @lid). Se devuelve frozenset para
+    lookup O(1) en el hot path del webhook. Field ausente o mal formado ->
+    frozenset vacio (backward compat con agentes viejos).
+    """
+    raw = get_config().get("blocked_chat_ids") or []
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(item.strip() for item in raw if isinstance(item, str) and item.strip())
+
+
 def get_limits() -> dict:
     """Retorna los limites del plan actual. 0 = sin limite."""
     defaults: dict = {
