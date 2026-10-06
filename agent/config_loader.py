@@ -117,13 +117,18 @@ def get_config() -> dict:
             _local_config = _load_local_yaml()
         config = _local_config.copy()
 
-    # Env vars siempre tienen prioridad (backward compat)
-    if os.getenv("NOTIFY_PHONE"):
-        config.setdefault("notifications", {})["notify_phone"] = os.getenv("NOTIFY_PHONE")
-    if os.getenv("NOTIFY_NAME"):
-        config.setdefault("notifications", {})["notify_name"] = os.getenv("NOTIFY_NAME")
+    # Env solo como fallback. Si CONFIG_URL ya trae notify_phone/name, gana el panel
+    # de Gowap. Antes NOTIFY_PHONE en Railway pisaba el número del panel y algunos
+    # agentes avisaban a un teléfono viejo (mezcla entre suscripciones).
+    notif = config.setdefault("notifications", {})
+    if not str(notif.get("notify_phone") or "").strip() and os.getenv("NOTIFY_PHONE"):
+        notif["notify_phone"] = os.getenv("NOTIFY_PHONE")
+    if not str(notif.get("notify_name") or "").strip() and os.getenv("NOTIFY_NAME"):
+        notif["notify_name"] = os.getenv("NOTIFY_NAME")
     if os.getenv("TZ_OFFSET"):
-        config.setdefault("timezone", {})["tz_offset"] = int(os.getenv("TZ_OFFSET"))
+        tz = config.get("timezone")
+        if tz is None or isinstance(tz, dict):
+            config.setdefault("timezone", {})["tz_offset"] = int(os.getenv("TZ_OFFSET"))
 
     # Sincronizar estado de pausa desde el config remoto
     if "agent_paused" in config:
